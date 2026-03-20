@@ -1,0 +1,156 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #0A0A0F;
+  --surface: #12121A;
+  --border-color: #1E1E2E;
+  --text-primary: #E4E4E7;
+  --text-secondary: #71717A;
+  --accent-green: #00FF88;
+  --accent-red: #FF3366;
+  --accent-indigo: #6366F1;
+}
+
+.light {
+  --background: #F8FAFC;
+  --surface: #FFFFFF;
+  --border-color: #E2E8F0;
+  --text-primary: #0F172A;
+  --text-secondary: #64748B;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--text-primary);
+  font-family: 'IBM Plex Mono', monospace;
+  min-height: 100vh;
+}
+
+/* Subtle scanline overlay */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.015) 2px,
+    rgba(0, 0, 0, 0.015) 4px
+  );
+}
+
+/* Scrollbars */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: var(--surface);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f5a;
+}
+
+/* Glow effects */
+.glow-green {
+  box-shadow: 0 0 10px rgba(0, 255, 136, 0.3), 0 0 20px rgba(0, 255, 136, 0.1);
+}
+
+.glow-red {
+  box-shadow: 0 0 10px rgba(255, 51, 102, 0.3), 0 0 20px rgba(255, 51, 102, 0.1);
+}
+
+.glow-text-green {
+  text-shadow: 0 0 8px rgba(0, 255, 136, 0.5);
+}
+
+/* Number transitions */
+.number-transition {
+  transition: color 0.2s ease;
+}
+
+/* Active indicator pulse */
+.active-dot {
+  animation: pulseGreen 2s ease-in-out infinite;
+}
+
+/* Surface cards */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+}
+
+/* Terminal text */
+.terminal {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* Price display */
+.price-display {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+/* Price flash animations */
+@keyframes flashGreen {
+  0%   { color: var(--accent-green); text-shadow: 0 0 12px rgba(0,255,136,0.8); }
+  100% { color: inherit; text-shadow: none; }
+}
+@keyframes flashRed {
+  0%   { color: var(--accent-red); text-shadow: 0 0 12px rgba(255,51,102,0.8); }
+  100% { color: inherit; text-shadow: none; }
+}
+.flash-green { animation: flashGreen 0.5s ease-out forwards; }
+.flash-red   { animation: flashRed   0.5s ease-out forwards; }
+
+/* Slide-in for new trades */
+@keyframes slideInDown {
+  from { opacity: 0; transform: translateY(-12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.slide-in { animation: slideInDown 0.3s ease-out forwards; }
+
+/* Number pop on change */
+@keyframes numPop {
+  0%   { transform: scale(1); }
+  40%  { transform: scale(1.15); }
+  100% { transform: scale(1); }
+}
+.num-pop { animation: numPop 0.25s ease-out; }
+
+/* Confidence bar glow */
+@keyframes confGlow {
+  0%   { filter: brightness(1); }
+  50%  { filter: brightness(1.4) drop-shadow(0 0 4px currentColor); }
+  100% { filter: brightness(1); }
+}
+.conf-glow { animation: confGlow 0.6s ease-out; }
+
+/* Pulse ring for active trades */
+@keyframes pulseRing {
+  0%   { box-shadow: 0 0 0 0 rgba(250, 204, 21, 0.4); }
+  70%  { box-shadow: 0 0 0 6px rgba(250, 204, 21, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(250, 204, 21, 0); }
+}
+.pulse-ring { animation: pulseRing 2s ease-out infinite; }

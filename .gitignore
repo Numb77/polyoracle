@@ -1,0 +1,47 @@
+# CRITICAL — NEVER COMMIT
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.cover
+
+# Logs
+logs/
+*.log
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+dashboard/.next/
+dashboard/node_modules/
+dashboard/out/
+
+# Data
+data/cache/
+*.csv
+*.parquet
+
+# OS
+.DS_Store
+Thumbs.db
