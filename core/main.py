@@ -27,8 +27,9 @@ import click
 
 from core.clock import WindowClock, WindowPhase, WindowState
 from core.config import get_config
-from core.logger import get_logger, setup_logging
+from core.logger import get_logger, setup_logging, add_dashboard_handler
 from data.aggregator import PriceAggregator
+import data.trade_db as trade_db
 from data.binance_ws import BinanceWebSocket, BtcTick, get_window_open_price, get_btc_window_open_price
 from data.candle_builder import CandleBuilder
 from data.chainlink_oracle import ChainlinkOracle
@@ -73,6 +74,9 @@ class PolyOracle:
         self._running = False
         self._current_window_ts = 0
         self._last_trade_votes = []
+        self._last_eval_tick: float = 0.0
+        self._last_eth_eval_tick: float = 0.0
+        self._last_fill_check_tick: float = 0.0
 
         # ── Data layer — BTC ──────────────────────────────────────────────────
         self._aggregator = PriceAggregator()
@@ -165,6 +169,7 @@ class PolyOracle:
         # ── Dashboard ─────────────────────────────────────────────────────────
         self._dashboard = DashboardServer()
         self._dashboard.set_command_handler(self._handle_command)
+        add_dashboard_handler(self._dashboard)  # Route CLAIM logs → dashboard terminal
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
@@ -222,8 +227,55 @@ class PolyOracle:
         self._clock.on_tick(self._on_clock_tick)
         self._clock.on_window_close(self._on_window_close)
 
+        # Pre-warm meta-learners from historical trade DB so agents don't start cold
+        await self._warmup_meta_learners()
+
+        # Process any claims that were pending from the previous session
+        await self._flush_startup_claims()
+
         self._running = True
         logger.info("PolyOracle initialized successfully")
+
+    async def _warmup_meta_learners(self) -> None:
+        """
+        Load historical trade outcomes from SQLite and pre-warm both BTC and
+        ETH meta-learners so agent weights reflect real performance from day 1,
+        not random chance.
+
+        The meta-learner rolling window is 50 trades/agent.  We load the last
+        500 resolved trades per asset so every agent's window is fully populated
+        even after many restarts.  DB is authoritative; the JSON file is a
+        session-only fallback when DB is empty.
+        """
+        try:
+            btc_records = await trade_db.load_resolved_trades(asset="btc", limit=500)
+            self._meta_learner.warmup_from_db(btc_records)
+        except Exception as exc:
+            logger.warning(f"BTC meta-learner DB warmup failed: {exc}")
+
+        try:
+            eth_records = await trade_db.load_resolved_trades(asset="eth", limit=500)
+            self._eth_meta_learner.warmup_from_db(eth_records)
+        except Exception as exc:
+            logger.warning(f"ETH meta-learner DB warmup failed: {exc}")
+
+    async def _flush_startup_claims(self) -> None:
+        """
+        At startup, kick off background tasks for any claims that were persisted
+        from the previous session but never completed (e.g. bot restarted mid-retry).
+        """
+        btc_count = len(self._claimer._pending)
+        eth_count = len(self._eth_claimer._pending)
+        total = btc_count + eth_count
+        if total == 0:
+            return
+
+        logger.info(
+            f"Resuming {total} pending claim(s) from previous session "
+            f"(BTC={btc_count}, ETH={eth_count})"
+        )
+        await self._claimer.process_pending_claims(self._wallet)
+        await self._eth_claimer.process_pending_claims(self._wallet)
 
     # ── Main run loop ─────────────────────────────────────────────────────────
 
@@ -317,6 +369,9 @@ class PolyOracle:
         self._clock.set_window_open_price(btc_price)
         self._strategy.update_window_open_price(btc_price)
         self._current_window_ts = window.window_ts
+        self._last_eval_tick = 0.0
+        self._last_eth_eval_tick = 0.0
+        self._last_fill_check_tick = 0.0
 
         # Fetch ETH open price
         eth_price = await get_window_open_price("ETHUSDT", window.window_ts)
@@ -333,7 +388,13 @@ class PolyOracle:
             f"BTC=${btc_price:,.2f} ETH=${eth_price:,.2f}"
         )
         self._dashboard.push("window_state", window.to_dict())
-        self._dashboard.push("eth_window_state", {**window.to_dict(), "open_price": eth_price, "current_price": eth_price, "delta_pct": 0.0})
+        self._dashboard.push("eth_window_state", {
+            **window.to_dict(),
+            "window_slug": f"eth-updown-5m-{window.window_ts}",
+            "open_price": eth_price,
+            "current_price": eth_price,
+            "delta_pct": 0.0,
+        })
         self._dashboard.push_log(
             "INFO", "clock",
             f"New window: {window.window_slug} | BTC ${btc_price:,.2f} | ETH ${eth_price:,.2f}"
@@ -376,7 +437,7 @@ class PolyOracle:
             )
 
     async def _on_clock_tick(self, window: WindowState) -> None:
-        """Every-second tick — push state to dashboard."""
+        """Every-second tick — push state to dashboard and re-evaluate during active phases."""
         now = time.time()
 
         self._dashboard.push("window_state", window.to_dict())
@@ -390,9 +451,39 @@ class PolyOracle:
         if eth_price > 0:
             eth_open = self._eth_strategy.window_open_price
             eth_delta = ((eth_price - eth_open) / eth_open * 100) if eth_open > 0 else 0.0
-            eth_window_data = {**window.to_dict(), "open_price": eth_open, "current_price": eth_price, "delta_pct": round(eth_delta, 4)}
+            eth_window_data = {
+                **window.to_dict(),
+                "window_slug": f"eth-updown-5m-{window.window_ts}",
+                "open_price": eth_open,
+                "current_price": eth_price,
+                "delta_pct": round(eth_delta, 4),
+            }
             self._dashboard.push("eth_window_state", eth_window_data)
             self._dashboard.push("eth_tick", {"price": eth_price, "timestamp": now})
+
+        # Re-evaluate every 5s during EVALUATING or TRADING phases.
+        # _maybe_trade already guards against double-trading via window history check.
+        EVAL_INTERVAL = 5.0
+        active_phases = (WindowPhase.EVALUATING, WindowPhase.TRADING)
+        if window.phase in active_phases and (now - self._last_eval_tick) >= EVAL_INTERVAL:
+            self._last_eval_tick = now
+            asyncio.create_task(self._maybe_trade(window, is_deadline=False))
+            asyncio.create_task(self._eth_maybe_trade(window, is_deadline=False))
+
+        # Poll active GTC orders for fills every 15s (live mode only).
+        # Gives real-time fill notification instead of waiting until window close.
+        FILL_POLL_INTERVAL = 15.0
+        has_active = (
+            self._order_manager.active_count > 0
+            or self._eth_order_manager.active_count > 0
+        )
+        if (
+            has_active
+            and not cfg.paper_mode
+            and (now - self._last_fill_check_tick) >= FILL_POLL_INTERVAL
+        ):
+            self._last_fill_check_tick = now
+            asyncio.create_task(self._poll_gtc_fills())
 
     async def _on_window_close(self, window: WindowState) -> None:
         """Window closed — cancel any unfilled GTC orders, then await resolution."""
@@ -401,14 +492,29 @@ class PolyOracle:
             "INFO", "clock", f"Window closed: {window.window_slug}"
         )
 
-        # Cancel any GTC orders that didn't fill before the window ended
-        cancelled = await self._executor.cancel_all_open()
-        if cancelled:
-            logger.info(f"BTC: Cancelled {cancelled} unfilled GTC order(s) at window close")
+        # Cancel any GTC orders that didn't fill before the window ended.
+        # Release exposure and refund reserved balance for each unfilled cancellation.
+        cancelled_orders = await self._executor.cancel_all_open()
+        for order in cancelled_orders:
+            self._exposure.close_position(order.size_usd)
+            self._balance += order.size_usd + order.fee_usd
+            self._dashboard.push("trade_cancelled", {"order_id": order.order_id})
+        if cancelled_orders:
+            logger.info(
+                f"BTC: Cancelled {len(cancelled_orders)} unfilled GTC order(s) at window close "
+                f"(exposure released, ${sum(o.size_usd for o in cancelled_orders):.2f} refunded)"
+            )
 
-        eth_cancelled = await self._eth_executor.cancel_all_open()
-        if eth_cancelled:
-            logger.info(f"ETH: Cancelled {eth_cancelled} unfilled GTC order(s) at window close")
+        eth_cancelled_orders = await self._eth_executor.cancel_all_open()
+        for order in eth_cancelled_orders:
+            self._exposure.close_position(order.size_usd)
+            self._balance += order.size_usd + order.fee_usd
+            self._dashboard.push("eth_trade_cancelled", {"order_id": order.order_id})
+        if eth_cancelled_orders:
+            logger.info(
+                f"ETH: Cancelled {len(eth_cancelled_orders)} unfilled GTC order(s) at window close "
+                f"(exposure released, ${sum(o.size_usd for o in eth_cancelled_orders):.2f} refunded)"
+            )
 
         # Process claims after a short delay (let resolution finalize)
         asyncio.create_task(self._process_window_resolution(window))
@@ -497,7 +603,7 @@ class PolyOracle:
             logger.warning("Could not resolve ETH market — skip")
             return
 
-        if decision.confidence.total < 51:
+        if decision.confidence.total < cfg.min_confidence_score:
             return
 
         stats = self._pnl.get_stats()
@@ -520,12 +626,31 @@ class PolyOracle:
         if size_usd < 1.0:
             return
 
-        order = await self._eth_executor.execute(
-            market=market,
-            direction=decision.direction,
-            confidence=decision.confidence.total,
-            position_size_usd=size_usd,
-        )
+        use_gtc = window.remaining_sec > cfg.gtc_window_sec
+
+        if use_gtc:
+            conf_bid = min(round(decision.confidence.total / 100.0, 2), cfg.max_token_price)
+            logger.info(
+                f"ETH early window ({window.remaining_sec:.0f}s remaining) → "
+                f"GTC maker (conf cap={conf_bid:.2f})"
+            )
+            order = await self._eth_executor.execute_gtc(
+                market=market,
+                direction=decision.direction,
+                confidence=decision.confidence.total,
+                position_size_usd=size_usd,
+                bid_price=conf_bid,
+            )
+        else:
+            logger.info(
+                f"ETH late window ({window.remaining_sec:.0f}s remaining) → FOK taker"
+            )
+            order = await self._eth_executor.execute(
+                market=market,
+                direction=decision.direction,
+                confidence=decision.confidence.total,
+                position_size_usd=size_usd,
+            )
 
         if order:
             self._exposure.open_position(order.size_usd)
@@ -536,21 +661,49 @@ class PolyOracle:
                 if self._eth_strategy.last_consensus else []
             )
 
+            order_type_tag = "GTC" if use_gtc else "FOK"
+            eth_consensus = self._eth_strategy.last_consensus
+            eth_votes_payload = eth_consensus.to_dict()["votes"] if eth_consensus else []
+            eth_conf_payload = decision.confidence.to_dict()
+
             self._dashboard.push("eth_trade_executed", {
                 "order_id": order.order_id,
                 "market": order.market_slug,
+                "asset": "ETH",
                 "direction": order.direction,
                 "price": order.price,
                 "size_usd": order.size_usd,
                 "confidence": order.confidence,
                 "window_ts": order.window_ts,
+                "order_type": order_type_tag,
+                "agent_votes": eth_votes_payload,
+                "confidence_breakdown": eth_conf_payload,
+                "window_delta_pct": round(
+                    (self._eth_aggregator.current_price - self._eth_strategy.window_open_price)
+                    / self._eth_strategy.window_open_price * 100
+                    if self._eth_strategy.window_open_price > 0 else 0.0,
+                    4
+                ),
             })
             self._dashboard.push_log(
                 "TRADE", "executor",
-                f"ETH {'[PAPER] ' if order.is_paper else ''}TRADE {order.direction} "
-                f"@ {order.price:.3f} × ${order.size_usd:.2f} "
+                f"{'[PAPER] ' if order.is_paper else ''}ETH TRADE {order.direction} "
+                f"[{order_type_tag}] @ {order.price:.3f} × ${order.size_usd:.2f} "
                 f"(conf={order.confidence:.0f})"
             )
+            asyncio.create_task(trade_db.record_trade(
+                order_id=order.order_id,
+                asset="ETH",
+                market=order.market_slug,
+                direction=order.direction,
+                entry_price=order.price,
+                size_usd=order.size_usd,
+                confidence=order.confidence,
+                window_ts=order.window_ts,
+                order_type=order_type_tag,
+                agent_votes=eth_votes_payload,
+                confidence_breakdown=eth_conf_payload,
+            ))
 
     async def _maybe_trade(self, window: WindowState, is_deadline: bool) -> None:
         """Core trading decision logic."""
@@ -609,8 +762,8 @@ class PolyOracle:
             return
 
         # Hard floor: Kelly requires confidence > 50 for positive edge
-        if decision.confidence.total < 51:
-            logger.info(f"Confidence {decision.confidence.total:.0f} below Kelly floor — skip")
+        if decision.confidence.total < cfg.min_confidence_score:
+            logger.info(f"Confidence {decision.confidence.total:.0f} below floor ({cfg.min_confidence_score}) — skip")
             return
 
         # Calculate position size
@@ -647,13 +800,37 @@ class PolyOracle:
             logger.info(f"Position size too small — skip ({reason})")
             return
 
-        # Execute
-        order = await self._executor.execute(
-            market=market,
-            direction=decision.direction,
-            confidence=decision.confidence.total,
-            position_size_usd=size_usd,
-        )
+        # ── GTC vs FOK routing ────────────────────────────────────────────────
+        # Early window (remaining > gtc_window_sec): bid at fair value via GTC
+        # maker.  Avoids the 0.99 ask problem — we post a resting bid and wait.
+        # Late window: use FOK taker for guaranteed immediate execution.
+        use_gtc = window.remaining_sec > cfg.gtc_window_sec
+
+        if use_gtc:
+            # Confidence-implied fair value is the ceiling; executor will fetch live
+            # ask and bid just below it to be competitive in the actual book.
+            conf_bid = min(round(decision.confidence.total / 100.0, 2), cfg.max_token_price)
+            logger.info(
+                f"Early window ({window.remaining_sec:.0f}s remaining) → "
+                f"GTC maker (conf cap={conf_bid:.2f})"
+            )
+            order = await self._executor.execute_gtc(
+                market=market,
+                direction=decision.direction,
+                confidence=decision.confidence.total,
+                position_size_usd=size_usd,
+                bid_price=conf_bid,
+            )
+        else:
+            logger.info(
+                f"Late window ({window.remaining_sec:.0f}s remaining) → FOK taker"
+            )
+            order = await self._executor.execute(
+                market=market,
+                direction=decision.direction,
+                confidence=decision.confidence.total,
+                position_size_usd=size_usd,
+            )
 
         if order:
             self._exposure.open_position(order.size_usd)
@@ -664,21 +841,88 @@ class PolyOracle:
                 if self._strategy.last_consensus else []
             )
 
+            order_type_tag = "GTC" if use_gtc else "FOK"
+            consensus = self._strategy.last_consensus
+            votes_payload = consensus.to_dict()["votes"] if consensus else []
+            conf_payload = decision.confidence.to_dict()
+
             self._dashboard.push("trade_executed", {
                 "order_id": order.order_id,
                 "market": order.market_slug,
+                "asset": "BTC",
                 "direction": order.direction,
                 "price": order.price,
                 "size_usd": order.size_usd,
                 "confidence": order.confidence,
                 "window_ts": order.window_ts,
+                "order_type": order_type_tag,
+                "agent_votes": votes_payload,
+                "confidence_breakdown": conf_payload,
+                "window_delta_pct": round(window.delta_pct, 4),
             })
             self._dashboard.push_log(
                 "TRADE", "executor",
-                f"{'[PAPER] ' if order.is_paper else ''}TRADE {order.direction} "
-                f"@ {order.price:.3f} × ${order.size_usd:.2f} "
+                f"{'[PAPER] ' if order.is_paper else ''}BTC TRADE {order.direction} "
+                f"[{order_type_tag}] @ {order.price:.3f} × ${order.size_usd:.2f} "
                 f"(conf={order.confidence:.0f})"
             )
+            asyncio.create_task(trade_db.record_trade(
+                order_id=order.order_id,
+                asset="BTC",
+                market=order.market_slug,
+                direction=order.direction,
+                entry_price=order.price,
+                size_usd=order.size_usd,
+                confidence=order.confidence,
+                window_ts=order.window_ts,
+                order_type=order_type_tag,
+                window_delta_pct=round(window.delta_pct, 4),
+                agent_votes=votes_payload,
+                confidence_breakdown=conf_payload,
+            ))
+
+    # ── GTC fill polling ──────────────────────────────────────────────────────
+
+    async def _poll_gtc_fills(self) -> None:
+        """Poll active live orders for fills every FILL_POLL_INTERVAL seconds."""
+        try:
+            btc_filled = await self._executor.check_and_update_fills()
+            eth_filled = await self._eth_executor.check_and_update_fills()
+
+            for order_id in btc_filled:
+                # Find the filled order and update P&L / exposure
+                for order in self._order_manager.get_recent_history(50):
+                    if order.order_id == order_id:
+                        self._exposure.close_position(order.size_usd)
+                        self._dashboard.push("trade_executed", {
+                            "order_id": order.order_id,
+                            "market": order.market_slug,
+                            "direction": order.direction,
+                            "price": order.filled_price,
+                            "size_usd": order.size_usd,
+                            "confidence": order.confidence,
+                            "window_ts": order.window_ts,
+                            "order_type": "GTC_FILLED",
+                        })
+                        break
+
+            for order_id in eth_filled:
+                for order in self._eth_order_manager.get_recent_history(50):
+                    if order.order_id == order_id:
+                        self._exposure.close_position(order.size_usd)
+                        self._dashboard.push("eth_trade_executed", {
+                            "order_id": order.order_id,
+                            "market": order.market_slug,
+                            "direction": order.direction,
+                            "price": order.filled_price,
+                            "size_usd": order.size_usd,
+                            "confidence": order.confidence,
+                            "window_ts": order.window_ts,
+                            "order_type": "GTC_FILLED",
+                        })
+                        break
+        except Exception as exc:
+            logger.debug(f"GTC fill poll error: {exc}")
 
     # ── Resolution ────────────────────────────────────────────────────────────
 
@@ -702,10 +946,7 @@ class PolyOracle:
         )
 
         # Process orders for this window
-        window_orders = [
-            o for o in self._order_manager.get_recent_history(20)
-            if o.window_ts == window.window_ts
-        ]
+        window_orders = self._order_manager.get_history_for_window(window.window_ts)
 
         for order in window_orders:
             # Skip orders that never fully executed, but notify dashboard to remove them
@@ -736,25 +977,36 @@ class PolyOracle:
 
             if won:
                 self._balance += order.filled_shares  # Payout at $1.00/share
-                logger.trade(  # type: ignore[attr-defined]
-                    f"WIN ${pnl:+.2f}: {order.direction} on {order.market_slug[:20]}..."
+                self._dashboard.push_log(
+                    "TRADE", "resolution",
+                    f"WIN +${pnl:.2f} | BTC {order.direction} | size=${order.size_usd:.2f} | conf={order.confidence:.0f}"
                 )
             else:
-                logger.trade(  # type: ignore[attr-defined]
-                    f"LOSS ${pnl:.2f}: {order.direction} on {order.market_slug[:20]}..."
+                self._dashboard.push_log(
+                    "TRADE", "resolution",
+                    f"LOSS -${abs(pnl):.2f} | BTC {order.direction} | size=${order.size_usd:.2f} | conf={order.confidence:.0f}"
                 )
 
             self._exposure.close_position(order.size_usd)
 
+            asset = "ETH" if order.market_slug.startswith("eth") else "BTC"
             self._dashboard.push("trade_resolved", {
                 "order_id": order.order_id,
                 "market": order.market_slug,
+                "asset": asset,
                 "direction": order.direction,
                 "actual_direction": actual_direction,
                 "won": won,
                 "pnl": round(pnl, 2),
                 "window_ts": window.window_ts,
+                "confidence": round(order.confidence, 1),
             })
+            asyncio.create_task(trade_db.resolve_trade(
+                order_id=order.order_id,
+                won=won,
+                actual_direction=actual_direction,
+                pnl=round(pnl, 2),
+            ))
 
         # Update portfolio stats
         self._drawdown.update(self._balance)
@@ -775,69 +1027,75 @@ class PolyOracle:
         """
         Determine the actual outcome of a window.
 
-        Live mode: queries the Polymarket REST API for the resolved token prices.
-          A resolved YES token trades at ~$1.00 (UP wins) or ~$0.00 (DOWN wins).
-          This is authoritative — never infer from BTC price in live mode.
+        Live mode: polls Polymarket's CLOB market endpoint for the `winner` field
+          on each token. This is set by Polymarket once the market settles and is
+          the authoritative source.  Polymarket uses Chainlink Data Streams
+          (data.chain.link/streams/btc-usd) which updates sub-second — but the
+          on-chain settlement takes 2-20 minutes after the window closes.
+          We poll for up to 15 minutes to avoid the wrong fallback.
 
-        Paper mode: infers from the window delta (BTC vs open price at close).
+        Fallback (paper mode or live timeout): infer from final CLOB token prices.
+          The YES token converges to ~1.0 when UP wins, ~0.0 when DOWN wins.
+          We do NOT use the on-chain Chainlink aggregator because it only updates
+          on ≥0.5% moves or hourly heartbeat — far too coarse for 5-min windows.
         """
-        # ── Live mode: query actual market resolution ─────────────────────────
+        # ── Live mode: poll winner field (up to 15 minutes) ──────────────────
         if not cfg.paper_mode:
-            try:
-                market = await self._token_resolver.resolve_current()
-                if market:
-                    # Poll YES token midpoint — resolved markets go to 0.00 or 1.00
-                    async with PolymarketRestClient() as rest:
-                        book = await rest.get_order_book(market.yes_token_id)
-                        asks = book.get("asks", [])
-                        bids = book.get("bids", [])
-                        # After resolution, one side collapses: price → 0 or → 1
-                        if asks:
-                            yes_price = float(asks[0]["price"])
-                        elif bids:
-                            yes_price = float(bids[0]["price"])
-                        else:
-                            yes_price = -1.0
+            market = await self._token_resolver.resolve_window(window.window_ts)
+            if market:
+                async with PolymarketRestClient() as rest:
+                    for attempt in range(30):   # 30 × 30s = 15 minutes
+                        try:
+                            result = await rest.get_market_winner(market.condition_id)
+                            if result:
+                                logger.info(
+                                    f"Live resolution: winner={result} "
+                                    f"(attempt {attempt + 1})"
+                                )
+                                return result
+                            if attempt < 29:
+                                logger.debug(
+                                    f"Market not yet resolved, retrying in 30s "
+                                    f"(attempt {attempt + 1}/30)"
+                                )
+                                await asyncio.sleep(30)
+                        except Exception as exc:
+                            logger.warning(f"Resolution poll failed: {exc}")
+                            await asyncio.sleep(30)
 
-                        if yes_price >= 0.95:
-                            logger.info(
-                                f"Live resolution: YES token @ {yes_price:.3f} → UP"
-                            )
-                            return "UP"
-                        elif 0.0 <= yes_price <= 0.05:
-                            logger.info(
-                                f"Live resolution: YES token @ {yes_price:.3f} → DOWN"
-                            )
-                            return "DOWN"
-                        else:
-                            logger.warning(
-                                f"Live resolution ambiguous: YES token @ {yes_price:.3f} "
-                                f"— falling back to price inference"
-                            )
-            except Exception as exc:
                 logger.warning(
-                    f"Live resolution query failed: {exc} — falling back to price inference"
+                    f"Market {market.condition_id} did not resolve within 15min "
+                    f"— falling back to CLOB token price inference"
                 )
 
-        # ── Paper mode (or live fallback): infer from price ───────────────────
+                # ── Fallback: read final token prices from CLOB ───────────────
+                # After the window closes, the YES token price converges to 1.0
+                # if UP won and 0.0 if DOWN won. This is more reliable than the
+                # on-chain Chainlink aggregator (which only updates on ≥0.5%
+                # moves) and doesn't require Chainlink Data Streams API access.
+                try:
+                    yes_price = await rest.get_last_trade_price(market.yes_token_id)
+                    if yes_price > 0:
+                        result = "UP" if yes_price >= 0.5 else "DOWN"
+                        logger.info(
+                            f"CLOB price inference: YES last-trade={yes_price:.3f} "
+                            f"→ {result}"
+                        )
+                        return result
+                except Exception as exc:
+                    logger.warning(f"CLOB price inference failed: {exc}")
+
+        # ── Paper mode: infer from Binance price ──────────────────────────────
+        # NOTE: intentionally NOT using the on-chain Chainlink aggregator here.
+        # For 5-minute moves of 0.02-0.10%, the aggregator does not update
+        # (requires ≥0.5% deviation or hourly heartbeat), making it useless
+        # for intra-day resolution.
         if window.open_price <= 0:
             return None
-
         current = self._aggregator.current_price
         if current <= 0:
             return None
-
-        # Prefer Chainlink oracle (same source Polymarket uses) over CEX price
-        oracle = self._oracle.latest
-        if oracle and oracle.price > 0:
-            if oracle.price > window.open_price:
-                return "UP"
-            elif oracle.price < window.open_price:
-                return "DOWN"
-
-        if current >= window.open_price:
-            return "UP"
-        return "DOWN"
+        return "UP" if current >= window.open_price else "DOWN"
 
     async def _eth_process_window_resolution(self, window: WindowState) -> None:
         """ETH: Wait for market resolution and process ETH claims."""
@@ -850,10 +1108,7 @@ class PolyOracle:
 
         logger.info(f"ETH Resolution: {window.window_slug} → {actual_direction}")
 
-        window_orders = [
-            o for o in self._eth_order_manager.get_recent_history(20)
-            if o.window_ts == window.window_ts
-        ]
+        window_orders = self._eth_order_manager.get_history_for_window(window.window_ts)
 
         for order in window_orders:
             if order.status in (
@@ -883,16 +1138,27 @@ class PolyOracle:
 
             if won:
                 self._balance += order.filled_shares
+                self._dashboard.push_log(
+                    "TRADE", "resolution",
+                    f"WIN +${pnl:.2f} | ETH {order.direction} | size=${order.size_usd:.2f} | conf={order.confidence:.0f}"
+                )
+            else:
+                self._dashboard.push_log(
+                    "TRADE", "resolution",
+                    f"LOSS -${abs(pnl):.2f} | ETH {order.direction} | size=${order.size_usd:.2f} | conf={order.confidence:.0f}"
+                )
             self._exposure.close_position(order.size_usd)
 
             self._dashboard.push("eth_trade_resolved", {
                 "order_id": order.order_id,
                 "market": order.market_slug,
+                "asset": "ETH",
                 "direction": order.direction,
                 "actual_direction": actual_direction,
                 "won": won,
                 "pnl": round(pnl, 2),
                 "window_ts": window.window_ts,
+                "confidence": round(order.confidence, 1),
             })
 
         self._drawdown.update(self._balance)
@@ -902,37 +1168,57 @@ class PolyOracle:
             self._eth_consensus.record_outcome(actual_direction, self._eth_last_trade_votes)
 
     async def _eth_determine_resolution(self, window: WindowState) -> str | None:
-        """Determine ETH window outcome (paper: from ETH price delta)."""
+        """
+        Determine ETH window outcome.
+
+        Polymarket resolves ETH markets using Chainlink Data Streams
+        (data.chain.link/streams/eth-usd), NOT the on-chain aggregator.
+        The on-chain aggregator only updates on ≥0.5% moves or hourly
+        heartbeat — useless for detecting 5-minute 0.02-0.10% ETH moves.
+        We poll the `winner` field for up to 15 minutes, then fall back
+        to CLOB final token prices.
+        """
         if not cfg.paper_mode:
-            try:
-                market = await self._eth_token_resolver.resolve_current()
-                if market:
-                    async with PolymarketRestClient() as rest:
-                        book = await rest.get_order_book(market.yes_token_id)
-                        asks = book.get("asks", [])
-                        bids = book.get("bids", [])
-                        if asks:
-                            yes_price = float(asks[0]["price"])
-                        elif bids:
-                            yes_price = float(bids[0]["price"])
-                        else:
-                            yes_price = -1.0
+            market = await self._eth_token_resolver.resolve_window(window.window_ts)
+            if market:
+                async with PolymarketRestClient() as rest:
+                    for attempt in range(30):   # 30 × 30s = 15 minutes
+                        try:
+                            result = await rest.get_market_winner(market.condition_id)
+                            if result:
+                                logger.info(
+                                    f"ETH live resolution: winner={result} "
+                                    f"(attempt {attempt + 1})"
+                                )
+                                return result
+                            if attempt < 29:
+                                await asyncio.sleep(30)
+                        except Exception as exc:
+                            logger.warning(f"ETH resolution poll failed: {exc}")
+                            await asyncio.sleep(30)
 
-                        if yes_price >= 0.95:
-                            return "UP"
-                        elif 0.0 <= yes_price <= 0.05:
-                            return "DOWN"
-            except Exception as exc:
-                logger.warning(f"ETH live resolution failed: {exc}")
+                logger.warning(
+                    f"ETH market {market.condition_id} did not resolve within 15min "
+                    f"— falling back to CLOB token price inference"
+                )
 
+                # Fallback: read final YES token price from CLOB
+                try:
+                    yes_price = await rest.get_last_trade_price(market.yes_token_id)
+                    if yes_price > 0:
+                        result = "UP" if yes_price >= 0.5 else "DOWN"
+                        logger.info(
+                            f"ETH CLOB price inference: YES last-trade={yes_price:.3f} "
+                            f"→ {result}"
+                        )
+                        return result
+                except Exception as exc:
+                    logger.warning(f"ETH CLOB price inference failed: {exc}")
+
+        # Paper mode: use Binance ETH price (NOT on-chain Chainlink aggregator)
         eth_open = self._eth_strategy.window_open_price
         if eth_open <= 0:
             return None
-
-        oracle = self._eth_oracle.latest
-        if oracle and oracle.price > 0:
-            return "UP" if oracle.price > eth_open else "DOWN"
-
         current = self._eth_aggregator.current_price
         if current <= 0:
             return None
@@ -1041,6 +1327,20 @@ class PolyOracle:
                 self._push_updated_agent_votes()
             else:
                 logger.warning(f"Mute failed: agent '{agent_name}' not found")
+
+        elif cmd_type == "collect_claims":
+            btc_pending = len(self._claimer._pending)
+            eth_pending = len(self._eth_claimer._pending)
+            total = btc_pending + eth_pending
+            if total == 0:
+                self._dashboard.push_log("INFO", "claimer", "No pending claims to collect")
+            else:
+                self._dashboard.push_log(
+                    "INFO", "claimer",
+                    f"Collecting {total} pending claim(s) (BTC={btc_pending}, ETH={eth_pending})..."
+                )
+                asyncio.create_task(self._claimer.process_pending_claims(self._wallet))
+                asyncio.create_task(self._eth_claimer.process_pending_claims(self._wallet))
 
         else:
             logger.warning(f"Unknown command: {cmd_type}")

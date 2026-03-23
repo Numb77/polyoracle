@@ -283,6 +283,89 @@ class MetaLearner:
             vote.session_accuracy = dict(stats.session_accuracy)
         return votes
 
+    def warmup_from_db(self, records: list[dict]) -> None:
+        """
+        Pre-warm the rolling histories from the SQLite trade DB.
+
+        Replaces any JSON-loaded state (DB is authoritative — it has the full
+        history, not just the last session). If DB has no records, the JSON
+        state loaded in __init__ is kept as-is.
+
+        records: list of dicts from trade_db.load_resolved_trades(), newest first.
+        Each row must have: actual_direction, agent_votes (JSON str), window_ts.
+        """
+        if not records:
+            return
+
+        # Clear JSON-loaded history and stale manual overrides — DB is authoritative
+        for agent_name in self._histories:
+            self._histories[agent_name].clear()
+        self._manual_overrides.clear()
+
+        # Records arrive newest-first; reverse so we append chronologically
+        # (deque(maxlen=50) keeps the tail = most recent, which is what we want)
+        for rec in reversed(records):
+            actual = rec.get("actual_direction")
+            if not actual:
+                continue
+
+            try:
+                votes = json.loads(rec.get("agent_votes") or "[]")
+            except Exception:
+                continue
+
+            window_ts = rec.get("window_ts") or 0
+            try:
+                utc_hour = datetime.fromtimestamp(window_ts, tz=timezone.utc).hour
+            except Exception:
+                utc_hour = 0
+
+            for vote_data in votes:
+                agent = vote_data.get("agent")
+                vote = vote_data.get("vote")
+                conviction = float(vote_data.get("conviction", 0.5))
+
+                # Only count directional votes (ABSTAIN carries no signal)
+                if not agent or vote not in ("UP", "DOWN"):
+                    continue
+
+                # Skip votes that were muted at the time — they didn't influence
+                # decisions and replaying them would inflate the agent's accuracy
+                if vote_data.get("is_muted", False):
+                    continue
+
+                if agent not in self._histories:
+                    self.register_agent(agent)
+
+                outcome = TradeOutcome(
+                    agent_name=agent,
+                    vote=vote,
+                    actual=actual,
+                    conviction=conviction,
+                    timestamp=float(window_ts),
+                    utc_hour=utc_hour,
+                )
+                self._histories[agent].append(outcome)
+
+        # Recompute weights for all agents that now have history
+        loaded: dict[str, int] = {}
+        for agent_name in list(self._histories.keys()):
+            n = len(self._histories[agent_name])
+            if n > 0:
+                self._update_stats(agent_name)
+                loaded[agent_name] = n
+
+        if loaded:
+            stats_summary = ", ".join(
+                f"{a}={n}trades/{self._stats[a].accuracy:.0%}"
+                f"{'[MUTED]' if self._stats[a].is_muted else ''}"
+                for a, n in loaded.items()
+            )
+            logger.info(f"Meta-learner warmed from DB [{len(records)} trades]: {stats_summary}")
+            self._save_state()
+        else:
+            logger.info("Meta-learner DB warmup: no resolved agent votes found, keeping JSON state")
+
     def _save_state(self) -> None:
         """Persist meta-learner state to disk."""
         try:
@@ -301,6 +384,7 @@ class MetaLearner:
             state = {
                 "histories": histories,
                 "manual_overrides": self._manual_overrides,
+                "muted_agents": [n for n, s in self._stats.items() if s.is_muted],
             }
             state_path = Path(self.STATE_FILE)
             state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -332,6 +416,8 @@ class MetaLearner:
                 histories = raw
                 self._manual_overrides = {}
 
+            muted_agents: set[str] = set(raw.get("muted_agents", []))
+
             for name, outcomes in histories.items():
                 self.register_agent(name)
                 for o in outcomes:
@@ -345,9 +431,17 @@ class MetaLearner:
                     )
                     self._histories[name].append(outcome)
                 self._update_stats(name)
+                # Restore muted status for agents that have insufficient post-mute
+                # history — prevents a restart from silently resetting weight to 1.0
+                if name in muted_agents and self._stats[name].trade_count < self.MIN_TRADES_FOR_WEIGHT:
+                    self._stats[name].is_muted = True
+                    self._stats[name].weight = 0.0
+                    logger.info(f"Agent {name} kept muted on load (insufficient history)")
+
             logger.info(
                 f"Meta-learner state loaded: {list(histories.keys())}, "
-                f"overrides: {self._manual_overrides}"
+                f"overrides: {self._manual_overrides}, "
+                f"persisted-muted: {list(muted_agents)}"
             )
         except Exception as exc:
             logger.warning(f"Failed to load meta-learner state: {exc}")

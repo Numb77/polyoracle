@@ -56,8 +56,10 @@ class FeeCalculator:
     The formula is an approximation; the API gives the definitive rate.
     """
 
-    # Default fee rate (bps) when API not available
-    DEFAULT_FEE_RATE_BPS = 150   # 1.5% = 150 bps
+    # Polymarket taker fee is ~4% on most markets.
+    # The dynamic formula (rate × p × (1-p) × 4) gives ≈4% at p=0.50,
+    # decreasing at the extremes (≈3.4% at p=0.70, ≈1.4% at p=0.90).
+    DEFAULT_FEE_RATE_BPS = 400   # 4.0% = 400 bps
     CACHE_TTL_SEC = 60           # Cached rate expires after 60 seconds
 
     def __init__(self) -> None:
@@ -123,7 +125,7 @@ class FeeCalculator:
 
         is_worth_trading = (
             net_edge_pct > 0
-            and fee_pct < 0.05   # Never pay more than 5% fee
+            and fee_pct < 0.06   # Never pay more than 6% fee (Polymarket max is ~4%)
         )
 
         return FeeEstimate(

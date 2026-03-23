@@ -16,9 +16,9 @@ from strategy.indicators import atr, bollinger_width, tick_direction_bias
 class VolatilityAgent(BaseAgent):
     """Volatility sentinel — sits out flat markets, amplifies clear moves."""
 
-    # ATR thresholds (as % of price)
-    LOW_VOL_THRESHOLD = 0.03     # Below this → ABSTAIN (flat market)
-    HIGH_VOL_THRESHOLD = 0.08    # Above this → high-vol regime
+    # ATR thresholds (as % of price) — aligned with market_regime.py thresholds
+    LOW_VOL_THRESHOLD = 0.02     # Below this → SNR-based check (truly flat)
+    HIGH_VOL_THRESHOLD = 0.06    # Above this → high-vol regime
 
     @property
     def name(self) -> str:
@@ -37,7 +37,7 @@ class VolatilityAgent(BaseAgent):
         window_delta_pct: float,
         df_1m: pd.DataFrame,
         df_5s: pd.DataFrame | None,
-        ob_imbalance: float,
+        ob_imbalance: float | None,
         oracle_delta_pct: float,
         atr_pct: float,
         **kwargs,
@@ -54,17 +54,49 @@ class VolatilityAgent(BaseAgent):
         if current_atr == 0.0 and len(df_1m) >= 15:
             current_atr = atr(df_1m, period=14)
 
-        # ── Low volatility: don't trade ───────────────────────────────────────
+        # ── Signal-to-noise ratio: delta relative to current volatility ──────
+        # A small delta in a dead-flat market can be more meaningful than
+        # a large delta in a noisy, high-vol market.
+        snr = abs(window_delta_pct) / current_atr if current_atr > 0 else 0.0
+
+        # ── Low volatility: use SNR instead of blanket ABSTAIN ────────────────
         if current_atr < self.LOW_VOL_THRESHOLD:
+            if snr < 1.5:
+                # Delta doesn't stand out above the noise floor — skip
+                return AgentVote(
+                    agent_name=self.name,
+                    vote=Vote.ABSTAIN,
+                    conviction=0.0,
+                    reasoning=(
+                        f"Low vol, weak signal (ATR={current_atr:.3f}%, "
+                        f"delta={window_delta_pct:+.3f}%, SNR={snr:.2f})"
+                    ),
+                )
+            # Clear signal in a flat market — SNR drives conviction
+            # SNR 1.5 → 0.30 conviction, SNR 5.0+ → 0.75 (capped)
+            direction = Vote.UP if window_delta_pct > 0 else Vote.DOWN
+            conviction = min(snr / 5.0, 0.75)
+            if df_5s is not None and len(df_5s) >= 10:
+                bias = tick_direction_bias(df_5s, lookback=10)
+                if (direction == Vote.UP and bias < -0.3) or (direction == Vote.DOWN and bias > 0.3):
+                    conviction *= 0.6
+                    note = " (conflicting ticks)"
+                else:
+                    note = ""
+            else:
+                note = ""
             return AgentVote(
                 agent_name=self.name,
-                vote=Vote.ABSTAIN,
-                conviction=0.0,
-                reasoning=f"Low volatility (ATR={current_atr:.3f}%) — staying out",
+                vote=direction,
+                conviction=conviction,
+                reasoning=(
+                    f"Low-vol breakout {direction.value}: ATR={current_atr:.3f}%, "
+                    f"delta={window_delta_pct:+.3f}%, SNR={snr:.2f}{note}"
+                ),
             )
 
-        # ── Need clear directional signal ─────────────────────────────────────
-        if abs(window_delta_pct) < 0.015:
+        # ── Normal/high vol: need a clear directional signal ──────────────────
+        if abs(window_delta_pct) < 0.01:
             return AgentVote(
                 agent_name=self.name,
                 vote=Vote.ABSTAIN,

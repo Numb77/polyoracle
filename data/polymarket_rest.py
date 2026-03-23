@@ -102,6 +102,27 @@ class PolymarketRestClient:
         """Get order book snapshot for a token."""
         return await self._get(self._clob_url, "/book", {"token_id": token_id})
 
+    async def get_market_winner(self, condition_id: str) -> str | None:
+        """
+        Check which outcome won for a resolved market.
+
+        Returns 'UP' if the YES token won, 'DOWN' if the NO token won,
+        or None if the market has not resolved yet.
+
+        Uses the CLOB /markets/{condition_id} endpoint — each token has a
+        `winner` boolean field that Polymarket sets once the market settles.
+        """
+        data = await self._get(self._clob_url, f"/markets/{condition_id}")
+        tokens = data.get("tokens", [])
+        for token in tokens:
+            if token.get("winner"):
+                outcome = token.get("outcome", "").upper()
+                if outcome == "YES":
+                    return "UP"
+                if outcome == "NO":
+                    return "DOWN"
+        return None  # not yet resolved
+
     async def get_tick_size(self, token_id: str) -> float:
         """Get minimum price increment for a token."""
         data = await self._get(self._clob_url, "/tick-size", {"token_id": token_id})
@@ -127,13 +148,13 @@ class PolymarketRestClient:
                 bids = book.get("bids", [])
                 asks = book.get("asks", [])
                 if bids and asks:
-                    best_bid = float(bids[0]["price"])
-                    best_ask = float(asks[0]["price"])
+                    best_bid = max(float(b["price"]) for b in bids)
+                    best_ask = min(float(a["price"]) for a in asks)
                     results[token_id] = (best_bid + best_ask) / 2
                 elif asks:
-                    results[token_id] = float(asks[0]["price"])
+                    results[token_id] = min(float(a["price"]) for a in asks)
                 elif bids:
-                    results[token_id] = float(bids[0]["price"])
+                    results[token_id] = max(float(b["price"]) for b in bids)
             except Exception as exc:
                 logger.warning(f"Failed to get price for {token_id}: {exc}")
         return results

@@ -56,13 +56,29 @@ class Config(BaseSettings):
 
     # ── Strategy parameters ───────────────────────────────────────────────────
     trade_amount_usd: float = Field(default=20.0, ge=1.0, le=1000.0)
-    min_confidence_score: int = Field(default=45, ge=0, le=100)
+    max_trade_amount_usd: float = Field(default=1000.0, ge=1.0, le=10000.0)
+    # Lowered from 51: allow trades down to 42% confidence.
+    # Kelly criterion still prevents negative-EV trades — this just lets more
+    # signals through so the executor can evaluate them.
+    min_confidence_score: int = Field(default=60, ge=0, le=100)
     min_token_price: float = Field(default=0.30, ge=0.01, le=0.99)
-    max_token_price: float = Field(default=0.87, ge=0.01, le=0.99)
-    entry_window_start_sec: int = Field(default=60, ge=5, le=120)
-    trading_window_start_sec: int = Field(default=45, ge=5, le=60)
-    entry_deadline_sec: int = Field(default=20, ge=1, le=30)
+    max_token_price: float = Field(default=0.88, ge=0.01, le=0.99)
+    # Enter at T+5s (295s remaining) — before market makers reprice from 0.50 to 0.99.
+    # By T+80s (old default) the direction is already priced at 99%.
+    entry_window_start_sec: int = Field(default=270, ge=5, le=299)
+    trading_window_start_sec: int = Field(default=240, ge=5, le=298)
+    entry_deadline_sec: int = Field(default=90, ge=1, le=120)
     max_concurrent_positions: int = Field(default=2, ge=1, le=10)
+    # Minimum BTC delta (% from window open) required to consider trading.
+    # Very low (0.005%) allows early-window signals where BTC barely moved yet.
+    min_window_delta_pct: float = Field(default=0.005, ge=0.001, le=0.5)
+    # No minimum edge floor — Kelly criterion in position sizer handles edge protection.
+    min_trade_edge: float = Field(default=0.0, ge=0.0, le=0.15)
+
+    # Seconds remaining in window below which we switch from GTC maker to FOK taker.
+    # Above this threshold we bid at fair value via a resting limit order.
+    # Below it, the window is too short to wait for a maker fill — use FOK.
+    gtc_window_sec: int = Field(default=120, ge=5, le=280)
 
     # ── Risk management ───────────────────────────────────────────────────────
     max_daily_loss_usd: float = Field(default=300.0, ge=1.0)
@@ -86,7 +102,7 @@ class Config(BaseSettings):
     # ── Derived constants (not from env) ─────────────────────────────────────
     window_duration_sec: int = 300          # 5-minute windows
     min_trade_shares: float = 5.0           # Polymarket minimum order size
-    max_position_pct: float = 0.10          # Never bet more than 10% of balance
+    max_position_pct: float = 0.08          # Never bet more than 10% of balance
     kelly_accuracy_window: int = 50         # Rolling window for meta-learner
     agent_mute_threshold: float = 0.45      # Mute agents below 45% accuracy
 

@@ -64,7 +64,7 @@ class ConsensusEngine:
         signal: CompositeSignal,
         df_1m: pd.DataFrame,
         df_5s: pd.DataFrame | None,
-        ob_imbalance: float,
+        ob_imbalance: float | None,
         oracle_delta_pct: float,
         atr_pct: float,
         oracle_latency_sec: float = 0.0,

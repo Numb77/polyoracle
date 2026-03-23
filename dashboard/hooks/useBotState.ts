@@ -68,6 +68,13 @@ function botReducer(state: BotState, action: Action): BotState {
 
         case "trade_executed": {
           const trade = data as TradeExecuted;
+          // Dedup: skip if this order_id or same asset+window_ts already tracked
+          const alreadyExists =
+            state.activePositions.some((p) => p.order_id === trade.order_id) ||
+            state.activePositions.some(
+              (p) => p.asset === trade.asset && p.window_ts === trade.window_ts
+            );
+          if (alreadyExists) return state;
           const pos: ActivePosition = { ...trade, opened_at: Date.now() };
           return {
             ...state,
@@ -78,6 +85,21 @@ function botReducer(state: BotState, action: Action): BotState {
 
         case "trade_resolved": {
           const resolved = data as TradeResolved;
+          // Enrich resolved trade with snapshot data from active position
+          const activePos = state.activePositions.find(
+            (p) => p.order_id === resolved.order_id
+          );
+          const enriched: TradeResolved = {
+            ...resolved,
+            price: activePos?.price,
+            size_usd: activePos?.size_usd,
+            confidence: resolved.confidence ?? activePos?.confidence,
+            order_type: activePos?.order_type,
+            agent_votes: activePos?.agent_votes,
+            confidence_breakdown: activePos?.confidence_breakdown,
+            window_delta_pct: activePos?.window_delta_pct,
+            opened_at: activePos?.opened_at,
+          };
           return {
             ...state,
             activeTradeIds: state.activeTradeIds.filter(
@@ -86,7 +108,7 @@ function botReducer(state: BotState, action: Action): BotState {
             activePositions: state.activePositions.filter(
               (p) => p.order_id !== resolved.order_id
             ),
-            recentTrades: [resolved, ...state.recentTrades].slice(
+            recentTrades: [enriched, ...state.recentTrades].slice(
               0,
               MAX_TRADE_HISTORY
             ),
@@ -128,6 +150,12 @@ function botReducer(state: BotState, action: Action): BotState {
 
         case "eth_trade_executed": {
           const trade = data as TradeExecuted;
+          const alreadyExists =
+            state.ethActivePositions.some((p) => p.order_id === trade.order_id) ||
+            state.ethActivePositions.some(
+              (p) => p.asset === trade.asset && p.window_ts === trade.window_ts
+            );
+          if (alreadyExists) return state;
           const pos: ActivePosition = { ...trade, opened_at: Date.now() };
           return {
             ...state,
@@ -138,6 +166,20 @@ function botReducer(state: BotState, action: Action): BotState {
 
         case "eth_trade_resolved": {
           const resolved = data as TradeResolved;
+          const ethActivePos = state.ethActivePositions.find(
+            (p) => p.order_id === resolved.order_id
+          );
+          const enrichedEth: TradeResolved = {
+            ...resolved,
+            price: ethActivePos?.price,
+            size_usd: ethActivePos?.size_usd,
+            confidence: resolved.confidence ?? ethActivePos?.confidence,
+            order_type: ethActivePos?.order_type,
+            agent_votes: ethActivePos?.agent_votes,
+            confidence_breakdown: ethActivePos?.confidence_breakdown,
+            window_delta_pct: ethActivePos?.window_delta_pct,
+            opened_at: ethActivePos?.opened_at,
+          };
           return {
             ...state,
             activeTradeIds: state.activeTradeIds.filter(
@@ -146,7 +188,7 @@ function botReducer(state: BotState, action: Action): BotState {
             ethActivePositions: state.ethActivePositions.filter(
               (p) => p.order_id !== resolved.order_id
             ),
-            recentTrades: [resolved, ...state.recentTrades].slice(
+            recentTrades: [enrichedEth, ...state.recentTrades].slice(
               0,
               MAX_TRADE_HISTORY
             ),

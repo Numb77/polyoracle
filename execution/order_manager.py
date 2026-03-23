@@ -160,6 +160,10 @@ class OrderManager:
     def get_active_for_window(self, window_ts: int) -> list[Order]:
         return [o for o in self._active.values() if o.window_ts == window_ts]
 
+    def get_history_for_window(self, window_ts: int) -> list[Order]:
+        """Return all historical orders (any status) for a given window timestamp."""
+        return [o for o in self._history if o.window_ts == window_ts]
+
     def get_recent_history(self, n: int = 50) -> list[Order]:
         return self._history[-n:]
 

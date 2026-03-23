@@ -45,7 +45,7 @@ export function Terminal() {
     setCommand("");
   };
 
-  const LEVELS = ["ALL", "TRADE", "INFO", "WARNING", "ERROR"];
+  const LEVELS = ["ALL", "TRADE", "CLAIM", "INFO", "WARNING", "ERROR"];
 
   const filtered: LogEntry[] =
     filter === "ALL"
@@ -110,6 +110,8 @@ export function Terminal() {
               className={`shrink-0 w-16 text-right ${
                 entry.level === "TRADE"
                   ? "text-accent-green"
+                  : entry.level === "CLAIM"
+                  ? "text-purple-400"
                   : entry.level === "WARNING"
                   ? "text-yellow-400"
                   : entry.level === "ERROR" || entry.level === "CRITICAL"

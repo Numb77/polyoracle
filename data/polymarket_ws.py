@@ -139,7 +139,19 @@ class PolymarketWebSocket:
 
     def subscribe_token(self, token_id: str) -> None:
         """Subscribe to order book updates for a token."""
+        if token_id in self._subscribed_tokens:
+            return
         self._subscribed_tokens.add(token_id)
+        # If WS is already connected, send the subscription immediately.
+        # _send_subscriptions() only runs at connect-time, so new tokens
+        # added later would never be sent to the server otherwise.
+        if self._ws is not None:
+            try:
+                asyncio.get_event_loop().create_task(
+                    self._send_token_subscription(token_id)
+                )
+            except RuntimeError:
+                pass  # No running loop — will be sent on next reconnect
 
     def unsubscribe_token(self, token_id: str) -> None:
         """Unsubscribe from a token."""
@@ -218,9 +230,33 @@ class PolymarketWebSocket:
         for token_id in tokens:
             logger.info(f"Subscribed to order book: {token_id[:16]}...")
 
-    async def _handle_message(self, raw_msg: str) -> None:
+    async def _send_token_subscription(self, token_id: str) -> None:
+        """Send a live subscription for a single token while already connected."""
+        if self._ws is None:
+            return
+        try:
+            sub_msg = {"assets_ids": [token_id], "type": "Market"}
+            await self._ws.send(json.dumps(sub_msg))
+            logger.info(f"Live-subscribed to order book: {token_id[:16]}...")
+        except Exception as exc:
+            logger.warning(f"Failed to live-subscribe to order book: {exc}")
+
+    async def _handle_message(self, raw_msg) -> None:
         """Parse and handle a WebSocket message."""
-        data = json.loads(raw_msg)
+        # Decode bytes (binary ping-pong / ACK frames)
+        if isinstance(raw_msg, bytes):
+            try:
+                raw_msg = raw_msg.decode("utf-8")
+            except Exception:
+                return
+        if not raw_msg or not raw_msg.strip():
+            return  # Ignore empty frames
+        try:
+            data = json.loads(raw_msg)
+        except json.JSONDecodeError:
+            # Subscription ACKs and keepalive frames are plain text, not JSON
+            logger.debug(f"Non-JSON frame ignored: {raw_msg[:80]!r}")
+            return
 
         # Polymarket sends messages as JSON arrays
         events = data if isinstance(data, list) else [data]

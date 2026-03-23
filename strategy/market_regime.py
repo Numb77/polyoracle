@@ -71,13 +71,15 @@ def detect_regime(df_1m: pd.DataFrame, df_5m: pd.DataFrame | None = None) -> Reg
     bb_width = bollinger_width(df_1m, period=20)
 
     # ── Classification logic ───────────────────────────────────────────────────
-    # Trending: high slope AND not too narrow Bollinger
-    # Volatile: high ATR but no clear trend
-    # Ranging: low ATR AND low slope OR very narrow Bollinger
+    # Trending: clear directional momentum — best conditions
+    # Volatile: high ATR with some direction — good conditions
+    # Ranging: truly flat — avoid or require strong SNR
 
-    is_trending = slope > 0.008 and bb_width > 0.05
-    is_volatile = vol > 0.08
-    is_ranging = vol < 0.03 and slope < 0.003
+    # Lowered slope threshold (0.008 → 0.005) so mild early-window trends get
+    # a bonus instead of falling through to the RANGING zero-bonus bucket.
+    is_trending = slope > 0.005 and bb_width > 0.04
+    is_volatile = vol > 0.06
+    is_ranging = vol < 0.02 and slope < 0.002
 
     if is_ranging:
         return RegimeResult(
@@ -88,7 +90,7 @@ def detect_regime(df_1m: pd.DataFrame, df_5m: pd.DataFrame | None = None) -> Reg
             description=f"Flat/ranging market (ATR={vol:.3f}%, slope={slope:.4f})",
         )
     elif is_trending:
-        trend_strength = min(1.0, slope / 0.02)
+        trend_strength = min(1.0, slope / 0.015)
         bonus = 15.0 * trend_strength
         return RegimeResult(
             regime=Regime.TRENDING,
@@ -106,10 +108,11 @@ def detect_regime(df_1m: pd.DataFrame, df_5m: pd.DataFrame | None = None) -> Reg
             description=f"Volatile market (ATR={vol:.3f}%)",
         )
     else:
-        # Mild conditions — small bonus
+        # Mild directional conditions — small bonus (was 3, raised to 5)
+        mild_trend = min(1.0, slope / 0.005)
         return RegimeResult(
             regime=Regime.RANGING,
-            bonus=3.0,
+            bonus=5.0 * mild_trend,
             trend_strength=slope,
             volatility=vol,
             description=f"Mixed conditions (ATR={vol:.3f}%, slope={slope:.4f})",

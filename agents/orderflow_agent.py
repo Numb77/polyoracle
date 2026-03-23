@@ -35,7 +35,7 @@ class OrderFlowAgent(BaseAgent):
         window_delta_pct: float,
         df_1m: pd.DataFrame,
         df_5s: pd.DataFrame | None,
-        ob_imbalance: float,
+        ob_imbalance: float | None,
         oracle_delta_pct: float,
         atr_pct: float,
         **kwargs,
@@ -44,10 +44,11 @@ class OrderFlowAgent(BaseAgent):
         ob_imbalance: from Polymarket YES token order book
           +1.0 = all bids (smart money buying YES → UP)
           -1.0 = all asks (smart money selling YES → DOWN)
+          None  = no order book data available
         """
 
         # If no order book data, abstain
-        if ob_imbalance == 0.0:
+        if ob_imbalance is None:
             return AgentVote(
                 agent_name=self.name,
                 vote=Vote.ABSTAIN,

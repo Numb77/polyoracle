@@ -122,7 +122,7 @@ class SignalCombiner:
         window_delta_pct: float,
         df_1m: pd.DataFrame,
         df_5s: pd.DataFrame | None = None,
-        order_book_imbalance: float = 0.0,
+        order_book_imbalance: float | None = None,
         oracle_delta_pct: float = 0.0,
     ) -> CompositeSignal:
         """
@@ -186,11 +186,12 @@ class SignalCombiner:
         ))
 
         # ── 6. Order Book Imbalance (weight 3) ───────────────────────────────
+        ob_score = float(max(-1.0, min(1.0, order_book_imbalance))) if order_book_imbalance is not None else 0.0
         components.append(SignalComponent(
             name="order_book",
-            score=float(max(-1.0, min(1.0, order_book_imbalance))),
+            score=ob_score,
             weight=self._weights["order_book"],
-            description=f"Book imbalance: {order_book_imbalance:+.3f}",
+            description=f"Book imbalance: {order_book_imbalance:+.3f}" if order_book_imbalance is not None else "Book imbalance: no data",
         ))
 
         # ── 7. Oracle Delta (weight 2) ────────────────────────────────────────
@@ -206,7 +207,7 @@ class SignalCombiner:
         return CompositeSignal(
             components=components,
             window_delta_score=window_score,
-            order_book_score=float(max(-1.0, min(1.0, order_book_imbalance))),
+            order_book_score=ob_score,
             oracle_delta_score=oracle_score,
         )
 

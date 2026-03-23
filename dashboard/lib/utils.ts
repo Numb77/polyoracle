@@ -100,6 +100,7 @@ export function getLogColor(level: LogLevel): string {
     case "DEBUG": return "text-zinc-500";
     case "INFO": return "text-zinc-300";
     case "TRADE": return "text-accent-green font-bold";
+    case "CLAIM": return "text-purple-400 font-bold";
     case "WARNING": return "text-yellow-400";
     case "ERROR": return "text-accent-red";
     case "CRITICAL": return "text-accent-red font-bold animate-blink";

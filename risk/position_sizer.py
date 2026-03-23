@@ -61,6 +61,7 @@ class PositionSizer:
         token_price: float,
         consecutive_losses: int = 0,
         drawdown_pct: float = 0.0,
+        fee_rate: float = 0.04,  # Polymarket taker fee (~4% on most markets)
     ) -> SizingResult:
         """
         Calculate position size.
@@ -72,36 +73,64 @@ class PositionSizer:
             token_price:        Token price we're buying (0-1)
             consecutive_losses: Recent consecutive losses (for scaling down)
             drawdown_pct:       Current drawdown from peak (%)
+            fee_rate:           Taker fee as a decimal (0.04 = 4%)
 
         Returns:
             SizingResult with recommended position size
         """
         adjustments = []
 
-        # ── Kelly calculation ─────────────────────────────────────────────────
-        # Net odds on a binary prediction market
-        # Buying YES at price p: win (1-p)/p, lose 1
+        # ── Kelly calculation — fee-adjusted ──────────────────────────────────
+        # Polymarket taker fee is ~4%. The fee increases the effective price
+        # you pay per share, reducing both the net odds and the break-even
+        # win probability threshold.
+        #
+        # Effective cost per share: price × (1 + fee_rate)
+        # Win: receive $1.00, net gain = 1 - price×(1+fee)
+        # Lose: lose price×(1+fee) per share
+        # Net odds b = (1 - effective_price) / effective_price
+        #
+        # Break-even condition (EV > 0): win_prob > effective_price
         if token_price <= 0 or token_price >= 1:
             token_price = 0.70   # Fallback
 
-        net_odds = (1.0 - token_price) / token_price
+        effective_price = min(0.98, token_price * (1.0 + fee_rate))
+        net_odds = (1.0 - effective_price) / effective_price
+        adjustments.append(f"Fee-adj price: {token_price:.3f} → {effective_price:.3f} ({fee_rate:.0%} fee)")
 
         # Win probability = market's implied probability + our edge over the market.
         # For prediction markets, Kelly is positive only when win_prob > token_price.
         # We anchor to the market price and add a confidence-based edge:
-        #   confidence 50  → 0% edge (no conviction above market)
-        #   confidence 75  → +12.5% edge
-        #   confidence 100 → +25% edge
+        #   confidence 40  → 0% edge (baseline — minimum viable confidence)
+        #   confidence 60  → +10% edge
+        #   confidence 100 → +30% edge
         # win_rate from historical data scales the edge (better track record → bigger edge).
         # When no trades exist yet (win_rate=0), use a conservative prior of 0.52.
         #
-        # Cap: must stay above token_price (to guarantee positive Kelly) but
-        # never exceed 0.99 (avoid division issues near 1.0). A hard 0.95 cap
-        # caused negative Kelly for any token priced above ~0.90, blocking all
-        # late-window trades on clearly-trending markets.
+        # Baseline lowered from 50→40 so confidence in the 42-50% range (which is
+        # "mild signal, weak conviction") can generate small positive Kelly and trade
+        # early in the window when the token is near 0.50 fair value.
         effective_win_rate = win_rate if win_rate > 0 else 0.52
-        edge = max(0.0, (confidence - 50) / 100 * 0.5) * (effective_win_rate / 0.55)
+        edge = max(0.0, (confidence - 40) / 100 * 0.5) * (effective_win_rate / 0.55)
         win_prob = min(0.99, token_price + edge)
+
+        # ── EV gate: win_prob must exceed the fee-adjusted break-even ───────────
+        # If our model's win probability doesn't beat the effective price
+        # (including fees), this trade has negative expected value.
+        if win_prob <= effective_price:
+            logger.info(
+                f"Negative EV after fees: win_prob={win_prob:.3f} ≤ "
+                f"effective_price={effective_price:.3f} "
+                f"(token={token_price:.3f} + {fee_rate:.0%} fee) — skip"
+            )
+            return SizingResult(
+                size_usd=0.0,
+                kelly_fraction=0.0,
+                raw_kelly=0.0,
+                adjustments=adjustments + [
+                    f"Negative EV: win_prob {win_prob:.3f} ≤ break-even {effective_price:.3f}"
+                ],
+            )
 
         # Kelly fraction
         q = 1.0 - win_prob
@@ -161,8 +190,8 @@ class PositionSizer:
         # Hard constraint first: funds available above minimum reserve
         available_usd = max(0.0, balance - cfg.min_usdc_balance)
 
-        # Platform minimum: larger of $10 or 0.5% of balance
-        platform_min = max(10.0, balance * 0.005)
+        # Platform minimum: trade_amount_usd is the baseline, also at least 0.5% of balance
+        platform_min = max(cfg.trade_amount_usd, balance * 0.005)
 
         if available_usd < platform_min:
             return SizingResult(
@@ -174,14 +203,14 @@ class PositionSizer:
                 ],
             )
 
-        # Ceiling: smaller of available funds and max position pct
-        ceiling_usd = min(available_usd, balance * self._max_position_pct)
+        # Ceiling: smaller of available funds, max position pct, and max_trade_amount_usd
+        ceiling_usd = min(available_usd, balance * self._max_position_pct, cfg.max_trade_amount_usd)
         if size_usd > ceiling_usd:
             size_usd = ceiling_usd
             adjustments.append(f"Capped at ${ceiling_usd:.2f}")
 
-        # Soft floor: platform minimum — let Kelly go below trade_amount_usd when
-        # edge is genuinely small, but never below exchange minimum.
+        # Soft floor: trade_amount_usd is the baseline — Kelly scales up from here,
+        # but never below the configured minimum trade size.
         if size_usd < platform_min:
             size_usd = platform_min
             adjustments.append(f"Floored at platform minimum ${platform_min:.2f}")

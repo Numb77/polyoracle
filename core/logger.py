@@ -17,17 +17,23 @@ from rich.logging import RichHandler
 from rich.theme import Theme
 
 
-# ── Custom log level for trades ───────────────────────────────────────────────
+# ── Custom log levels ─────────────────────────────────────────────────────────
 TRADE_LEVEL = 25  # Between INFO(20) and WARNING(30)
+CLAIM_LEVEL = 26  # Same band as TRADE, distinct label for purple UI colouring
 logging.addLevelName(TRADE_LEVEL, "TRADE")
+logging.addLevelName(CLAIM_LEVEL, "CLAIM")
 
 
 class TradeLogger(logging.Logger):
-    """Extended logger with .trade() method for trade events."""
+    """Extended logger with .trade() and .claim() methods for trade events."""
 
     def trade(self, msg: str, *args: Any, **kwargs: Any) -> None:
         if self.isEnabledFor(TRADE_LEVEL):
             self._log(TRADE_LEVEL, msg, args, **kwargs)
+
+    def claim(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        if self.isEnabledFor(CLAIM_LEVEL):
+            self._log(CLAIM_LEVEL, msg, args, **kwargs)
 
 
 logging.setLoggerClass(TradeLogger)
@@ -112,3 +118,40 @@ def setup_logging(level: str = "INFO", log_file: str = "logs/polyoracle.log") ->
 def get_logger(name: str) -> TradeLogger:
     """Get a named logger. Always use this instead of logging.getLogger()."""
     return logging.getLogger(name)  # type: ignore[return-value]
+
+
+class _DashboardLogHandler(logging.Handler):
+    """
+    Logging handler that forwards CLAIM-level log records to the dashboard
+    WebSocket terminal so that claim events appear in purple.
+
+    Only CLAIM-level records are forwarded — other levels are already pushed
+    explicitly via dashboard.push_log() from main.py, so we don't duplicate.
+    """
+
+    def __init__(self, dashboard: Any) -> None:
+        super().__init__()
+        self._dashboard = dashboard
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if record.levelname != "CLAIM":
+                return
+            module = record.name.split(".")[-1]
+            message = self.format(record)
+            self._dashboard.push_log("CLAIM", module, message)
+        except Exception:
+            pass  # Never raise from a logging handler
+
+
+def add_dashboard_handler(dashboard: Any) -> None:
+    """
+    Install a log handler that forwards CLAIM-level Python log records to the
+    dashboard WebSocket terminal (shown in purple).
+
+    Call once from main.py after the DashboardServer is created.
+    """
+    handler = _DashboardLogHandler(dashboard)
+    handler.setLevel(CLAIM_LEVEL)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.getLogger().addHandler(handler)

@@ -90,21 +90,36 @@ export interface ConfidenceBreakdown {
 export interface TradeExecuted {
   order_id: string;
   market: string;
+  asset: "BTC" | "ETH";
   direction: "UP" | "DOWN";
   price: number;
   size_usd: number;
   confidence: number;
   window_ts: number;
+  order_type?: string;
+  agent_votes?: AgentVote[];
+  confidence_breakdown?: ConfidenceBreakdown;
+  window_delta_pct?: number;
 }
 
 export interface TradeResolved {
   order_id: string;
   market: string;
+  asset: "BTC" | "ETH";
   direction: "UP" | "DOWN";
   actual_direction: "UP" | "DOWN";
   won: boolean;
   pnl: number;
   window_ts: number;
+  // Carried forward from TradeExecuted for the detail view:
+  price?: number;
+  size_usd?: number;
+  confidence?: number;
+  order_type?: string;
+  agent_votes?: AgentVote[];
+  confidence_breakdown?: ConfidenceBreakdown;
+  window_delta_pct?: number;
+  opened_at?: number;
 }
 
 // ── Portfolio ─────────────────────────────────────────────────────────────────
@@ -144,7 +159,7 @@ export interface CircuitBreakerStatus {
 
 // ── Log ───────────────────────────────────────────────────────────────────────
 
-export type LogLevel = "DEBUG" | "INFO" | "TRADE" | "WARNING" | "ERROR" | "CRITICAL";
+export type LogLevel = "DEBUG" | "INFO" | "TRADE" | "CLAIM" | "WARNING" | "ERROR" | "CRITICAL";
 
 export interface LogEntry {
   level: LogLevel;
