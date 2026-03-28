@@ -45,6 +45,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             window_ts            INTEGER NOT NULL,
             order_type           TEXT    NOT NULL,          -- 'GTC' or 'FOK'
             window_delta_pct     REAL,
+            open_price           REAL,                      -- BTC/ETH price at window open
             agent_votes          TEXT,                      -- JSON array
             confidence_breakdown TEXT,                      -- JSON object
             created_at           REAL    NOT NULL,
@@ -68,6 +69,13 @@ def _init_db() -> None:
     conn = _get_conn()
     try:
         _create_schema(conn)
+        # Migrate existing databases that predate the open_price column
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN open_price REAL")
+            conn.commit()
+            logger.info("trade_db: migrated — added open_price column")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
     finally:
         conn.close()
 
@@ -85,6 +93,7 @@ def _record_trade_sync(
     window_ts: int,
     order_type: str,
     window_delta_pct: float | None,
+    open_price: float | None,
     agent_votes: list | None,
     confidence_breakdown: dict | None,
 ) -> None:
@@ -93,12 +102,12 @@ def _record_trade_sync(
         conn.execute("""
             INSERT OR IGNORE INTO trades
             (order_id, asset, market, direction, entry_price, size_usd, confidence,
-             window_ts, order_type, window_delta_pct, agent_votes, confidence_breakdown,
-             created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             window_ts, order_type, window_delta_pct, open_price,
+             agent_votes, confidence_breakdown, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             order_id, asset, market, direction, entry_price, size_usd, confidence,
-            window_ts, order_type, window_delta_pct,
+            window_ts, order_type, window_delta_pct, open_price,
             json.dumps(agent_votes) if agent_votes else None,
             json.dumps(confidence_breakdown) if confidence_breakdown else None,
             time.time(),
@@ -143,6 +152,7 @@ async def record_trade(
     window_ts: int,
     order_type: str,
     window_delta_pct: float | None = None,
+    open_price: float | None = None,
     agent_votes: list | None = None,
     confidence_breakdown: dict | None = None,
 ) -> None:
@@ -151,7 +161,7 @@ async def record_trade(
     await loop.run_in_executor(
         _executor, _record_trade_sync,
         order_id, asset, market, direction, entry_price, size_usd, confidence,
-        window_ts, order_type, window_delta_pct, agent_votes, confidence_breakdown,
+        window_ts, order_type, window_delta_pct, open_price, agent_votes, confidence_breakdown,
     )
 
 
@@ -177,7 +187,8 @@ def _load_resolved_trades_sync(asset: str | None, limit: int) -> list[dict]:
     try:
         query = """
             SELECT order_id, asset, direction, actual_direction,
-                   agent_votes, confidence, window_ts, won, pnl
+                   agent_votes, confidence, window_ts, won, pnl,
+                   entry_price, size_usd, order_type
             FROM trades
             WHERE actual_direction IS NOT NULL
               AND agent_votes IS NOT NULL
@@ -194,6 +205,38 @@ def _load_resolved_trades_sync(asset: str | None, limit: int) -> list[dict]:
         conn.close()
 
 
+def _load_pnl_records_sync(asset: str | None, limit: int) -> list[dict]:
+    """Load resolved trade records for PnL tracker seeding (no agent_votes filter)."""
+    conn = _get_conn()
+    try:
+        query = """
+            SELECT order_id, direction, won, pnl, entry_price, confidence, window_ts
+            FROM trades
+            WHERE won IS NOT NULL
+        """
+        params: list = []
+        if asset:
+            query += " AND lower(asset) = lower(?)"
+            params.append(asset)
+        query += " ORDER BY window_ts ASC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def load_pnl_records(
+    asset: str | None = None,
+    limit: int = 1000,
+) -> list[dict]:
+    """Return resolved trade records for PnL tracker seeding (ordered oldest-first)."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        _executor, _load_pnl_records_sync, asset, limit
+    )
+
+
 async def load_resolved_trades(
     asset: str | None = None,
     limit: int = 500,
@@ -207,6 +250,38 @@ async def load_resolved_trades(
     return await loop.run_in_executor(
         _executor, _load_resolved_trades_sync, asset, limit
     )
+
+
+def _load_unresolved_trades_sync(min_age_sec: int) -> list[dict]:
+    """
+    Return trades that have no outcome yet and are older than min_age_sec seconds.
+
+    These are candidates for re-resolution on startup — the bot was stopped
+    while the resolution coroutine was mid-poll.
+    """
+    conn = _get_conn()
+    try:
+        cutoff = time.time() - min_age_sec
+        rows = conn.execute("""
+            SELECT order_id, asset, market, window_ts, direction,
+                   open_price, entry_price, size_usd, confidence
+            FROM trades
+            WHERE won IS NULL
+              AND created_at < ?
+            ORDER BY window_ts ASC
+        """, (cutoff,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def load_unresolved_trades(min_age_sec: int = 600) -> list[dict]:
+    """
+    Return trades with no outcome that are at least min_age_sec seconds old.
+    Used at startup to re-resolve any trades that survived a bot restart.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, _load_unresolved_trades_sync, min_age_sec)
 
 
 # ── Init on import ────────────────────────────────────────────────────────────

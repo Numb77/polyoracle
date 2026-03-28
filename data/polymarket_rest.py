@@ -68,7 +68,12 @@ class PolymarketRestClient:
                 resp.raise_for_status()
                 return await resp.json(content_type=None)
         except aiohttp.ClientResponseError as exc:
-            logger.error(f"HTTP {exc.status} for {url}: {exc.message}")
+            if exc.status == 404:
+                # 404 is expected in several contexts (market resolved = book closed,
+                # market not yet listed, etc.). Callers handle and log appropriately.
+                logger.debug(f"HTTP 404 for {url}")
+            else:
+                logger.error(f"HTTP {exc.status} for {url}: {exc.message}")
             raise
         except aiohttp.ClientError as exc:
             logger.error(f"Request failed for {url}: {exc}")

@@ -43,16 +43,19 @@ class MeanReversionAgent(BaseAgent):
         reasons = []
 
         # ── RSI extreme ───────────────────────────────────────────────────────
+        # Tightened thresholds: 80/20 instead of 75/25.
+        # In a 5-min window, only truly extreme RSI readings are reliable
+        # contrarian signals — borderline readings just fight the trend.
         if len(df_1m) >= 15:
             r = rsi(df_1m, period=14)
-            if r >= 75:
+            if r >= 80:
                 # Overbought — expect DOWN
-                strength = min((r - 70) / 20, 1.0)
+                strength = min((r - 80) / 15, 1.0)
                 signals.append(-strength)
                 reasons.append(f"RSI={r:.0f} overbought")
-            elif r <= 25:
+            elif r <= 20:
                 # Oversold — expect UP
-                strength = min((30 - r) / 20, 1.0)
+                strength = min((20 - r) / 15, 1.0)
                 signals.append(strength)
                 reasons.append(f"RSI={r:.0f} oversold")
 
@@ -68,12 +71,13 @@ class MeanReversionAgent(BaseAgent):
                 reasons.append(f"Price at {label}")
 
         # ── Rate of Change ────────────────────────────────────────────────────
-        # If price moved a lot very fast, expect at least a partial pullback
+        # Tightened: require 0.25% move (was 0.15%) to call it extreme.
+        # Small 3-candle moves rarely reverse in the same 5-min window.
         if len(df_1m) >= 6:
             roc_3 = rate_of_change(df_1m, period=3)
-            if abs(roc_3) >= 0.15:
+            if abs(roc_3) >= 0.25:
                 # Very large 3-candle move — bet on partial reversal
-                reversion = -np.sign(roc_3) * min(abs(roc_3) / 0.3, 0.7)
+                reversion = -np.sign(roc_3) * min(abs(roc_3) / 0.4, 0.7)
                 signals.append(float(reversion))
                 reasons.append(f"3m RoC={roc_3:+.2f}% extreme")
 

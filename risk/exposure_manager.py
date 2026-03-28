@@ -20,6 +20,7 @@ class ExposureManager:
 
     def __init__(self) -> None:
         self._max_positions = cfg.max_concurrent_positions
+        self._max_exposure_usd = cfg.max_exposure_usd
         self._active_count: int = 0
         self._active_usd: float = 0.0
 
@@ -32,6 +33,12 @@ class ExposureManager:
             return (
                 False,
                 f"Max positions reached ({self._active_count}/{self._max_positions})",
+            )
+        if self._active_usd + size_usd > self._max_exposure_usd:
+            return (
+                False,
+                f"USD exposure limit: ${self._active_usd:.2f} + ${size_usd:.2f} "
+                f"> ${self._max_exposure_usd:.2f} max",
             )
         return True, "OK"
 
@@ -49,6 +56,20 @@ class ExposureManager:
         """Reset all tracked positions (e.g., after restart)."""
         self._active_count = 0
         self._active_usd = 0.0
+
+    def reconcile(self, true_count: int, true_usd: float) -> None:
+        """
+        Overwrite the counter with ground-truth values derived from the order
+        managers.  Call this periodically to self-heal any drift caused by
+        missed close_position() calls (e.g. no-edge cancels, bot restarts).
+        """
+        if self._active_count != true_count or abs(self._active_usd - true_usd) > 0.01:
+            logger.info(
+                f"Exposure reconciled: {self._active_count}→{true_count} positions, "
+                f"${self._active_usd:.2f}→${true_usd:.2f} USD"
+            )
+        self._active_count = true_count
+        self._active_usd = true_usd
 
     @property
     def active_count(self) -> int:
@@ -69,5 +90,6 @@ class ExposureManager:
             "active_count": self._active_count,
             "max_count": self._max_positions,
             "active_usd": round(self._active_usd, 2),
+            "max_exposure_usd": self._max_exposure_usd,
             "utilization_pct": round(self.utilization_pct, 1),
         }

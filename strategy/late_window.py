@@ -52,6 +52,7 @@ class LateWindowStrategy(BaseStrategy):
         self._window_open_price: float = 0.0
         self._last_evaluation: TradeDecision | None = None
         self._last_consensus: ConsensusResult | None = None
+        self._last_regime: RegimeResult | None = None
         self._current_yes_token_id: str = ""
         self._current_no_token_id: str = ""
         self._prev_window_delta_pct: float = 0.0  # For momentum acceleration
@@ -59,6 +60,10 @@ class LateWindowStrategy(BaseStrategy):
     @property
     def last_consensus(self) -> ConsensusResult | None:
         return self._last_consensus
+
+    @property
+    def last_regime(self) -> RegimeResult | None:
+        return self._last_regime
 
     @property
     def name(self) -> str:
@@ -79,7 +84,9 @@ class LateWindowStrategy(BaseStrategy):
         self._current_yes_token_id = yes_token_id
         self._current_no_token_id = no_token_id
 
-    async def evaluate(self, window: WindowState) -> TradeDecision:
+    async def evaluate(
+        self, window: WindowState, cross_asset_delta_pct: float = 0.0
+    ) -> TradeDecision:
         """
         Full strategy evaluation pipeline:
         1. Compute window delta
@@ -174,6 +181,7 @@ class LateWindowStrategy(BaseStrategy):
 
         # ── 4. Market regime ─────────────────────────────────────────────────
         regime = detect_regime(df_1m)
+        self._last_regime = regime
 
         # In perfectly flat markets with truly no signal, skip.
         # Use SNR so a tiny delta in an ultra-low-vol environment isn't thrown out.
@@ -200,7 +208,46 @@ class LateWindowStrategy(BaseStrategy):
 
         self._last_consensus = consensus
 
+        # ── 5b. Minimum active votes gate ────────────────────────────────────
+        # Require at least 2 non-muted agents to have cast a directional vote.
+        # A single oracle vote should NEVER be enough to trigger a trade —
+        # solo votes inflated the confidence score and caused our largest losses.
+        active_directional = len(consensus.votes) - consensus.abstain_count
+        if active_directional < 2:
+            return self._no_trade(
+                f"Insufficient agent consensus: only {active_directional}/5 agents "
+                f"voted directionally — need ≥ 2"
+            )
+
+        # ── 5c. High-accuracy dissent gate ────────────────────────────────────
+        # If a non-muted agent with accuracy > 70% is voting AGAINST our direction
+        # with conviction > 0.60, that is a high-quality warning from an agent
+        # that has earned its credibility. Skip the trade.
+        # Exception: if window delta is very strong (≥ 0.20%), momentum usually wins.
+        if abs(window_delta_pct) < 0.20:
+            from agents.agent_base import Vote as _Vote
+            our_vote = _Vote.UP if window_direction == "UP" else _Vote.DOWN
+            for v in consensus.votes:
+                if (
+                    not v.is_muted
+                    and v.vote not in (our_vote, _Vote.ABSTAIN)
+                    and v.accuracy >= 0.70
+                    and v.conviction >= 0.60
+                ):
+                    return self._no_trade(
+                        f"High-accuracy dissent: {v.agent_name} "
+                        f"({v.accuracy:.0%} acc) voted {v.vote.value} "
+                        f"vs our {window_direction} with {v.conviction:.2f} conviction — skip"
+                    )
+
         # ── 6. Confidence score ──────────────────────────────────────────────
+        # Cross-asset alignment: +1 = other asset confirms direction,
+        # -1 = diverging (penalised), 0 = flat/unknown (neutral).
+        cross_asset_alignment = 0.0
+        if abs(cross_asset_delta_pct) >= 0.01:
+            same_direction = (window_delta_pct * cross_asset_delta_pct) > 0
+            cross_asset_alignment = 1.0 if same_direction else -1.0
+
         confidence = self._confidence_engine.compute(
             composite_signal=signal,
             window_delta_pct=window_delta_pct,
@@ -210,6 +257,8 @@ class LateWindowStrategy(BaseStrategy):
             regime_volatility=regime.volatility,
             remaining_sec=window.remaining_sec,
             polymarket_alignment=polymarket_alignment,
+            elapsed_sec=max(0.0, 300.0 - window.remaining_sec),
+            cross_asset_alignment=cross_asset_alignment,
         )
 
         # ── 7. Direction: always follow window delta ─────────────────────────

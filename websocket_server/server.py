@@ -48,6 +48,12 @@ class DashboardServer:
         # Latest state snapshot (for new client catch-up)
         self._last_state: dict[str, Any] = {}
 
+        # Rolling history pushed to new clients on connect
+        # Keeps the last 100 resolved trade events (BTC + ETH combined)
+        self._trade_history: list[dict] = []
+        # Keeps the last 300 log messages
+        self._log_buffer: list[dict] = []
+
     # ── State push API (called by bot) ────────────────────────────────────────
 
     def push(self, msg_type: str, data: Any) -> None:
@@ -57,6 +63,11 @@ class DashboardServer:
             self._queue.put_nowait(msg)
             # Cache latest state per type for new clients
             self._last_state[msg_type] = msg
+            # Track trade history for catch-up on new connect
+            if msg_type in ("trade_resolved", "eth_trade_resolved"):
+                self._trade_history.append(msg)
+                if len(self._trade_history) > 100:
+                    self._trade_history = self._trade_history[-100:]
         except asyncio.QueueFull:
             # Drop oldest message to make room
             try:
@@ -67,17 +78,37 @@ class DashboardServer:
 
     def push_log(self, level: str, module: str, message: str) -> None:
         """Push a log message to the terminal tab."""
-        self.push("log", {
+        data = {
             "level": level,
             "module": module,
             "message": message,
             "timestamp": time.strftime("%H:%M:%S"),
-        })
+        }
+        msg = {"type": "log", "data": data, "ts": time.time()}
+        self._log_buffer.append(msg)
+        if len(self._log_buffer) > 300:
+            self._log_buffer = self._log_buffer[-300:]
+        try:
+            self._queue.put_nowait(msg)
+            self._last_state["log"] = msg
+        except asyncio.QueueFull:
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(msg)
+            except Exception:
+                pass
 
     # ── Server lifecycle ──────────────────────────────────────────────────────
 
     async def start(self) -> None:
         """Start the WebSocket server and the broadcast loop."""
+        import logging as _logging
+        # Suppress noisy "opening handshake failed" errors that fire when browsers
+        # or health-check probes connect to the WS port without doing a proper
+        # WebSocket upgrade (e.g. Next.js HMR, macOS mDNS probes). These are
+        # harmless connection resets and don't need to appear as ERRORs.
+        _logging.getLogger("websockets.server").setLevel(_logging.CRITICAL)
+
         self._running = True
         host = "localhost"
         port = cfg.ws_server_port
@@ -124,12 +155,39 @@ class DashboardServer:
         logger.info(f"Dashboard client connected: {client_addr}")
         self._clients.add(websocket)
 
-        # Send catch-up snapshot of latest state
+        # Tell the frontend to clear its log/trade buffers before we replay them.
+        # Without this, every reconnect (e.g. Next.js hot reload) doubles the
+        # log and trade history because the buffer is replayed on top of existing state.
+        try:
+            await websocket.send(json.dumps(
+                {"type": "connection_init", "data": {"reset": True}, "ts": time.time()},
+                default=str,
+            ))
+        except Exception:
+            pass
+
+        # Send catch-up snapshot of latest state (window, agents, confidence, etc.)
         for msg_type, msg in self._last_state.items():
+            if msg_type == "log":
+                continue  # Sent separately below
             try:
                 await websocket.send(json.dumps(msg, default=str))
             except Exception:
                 pass
+
+        # Replay recent log buffer so the terminal shows history from before connect
+        for log_msg in self._log_buffer[-200:]:
+            try:
+                await websocket.send(json.dumps(log_msg, default=str))
+            except Exception:
+                break
+
+        # Replay resolved trade history so Trade History tab is populated immediately
+        for trade_msg in self._trade_history:
+            try:
+                await websocket.send(json.dumps(trade_msg, default=str))
+            except Exception:
+                break
 
         try:
             # Handle incoming commands from dashboard

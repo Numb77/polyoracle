@@ -94,7 +94,19 @@ class PositionSizer:
         if token_price <= 0 or token_price >= 1:
             token_price = 0.70   # Fallback
 
-        effective_price = min(0.98, token_price * (1.0 + fee_rate))
+        effective_price = token_price * (1.0 + fee_rate)
+        if effective_price >= 1.0:
+            # Fees push the cost per share above $1.00 — impossible to profit even on a win.
+            logger.info(
+                f"Token too expensive after fees: {token_price:.3f} × (1+{fee_rate:.0%}) "
+                f"= {effective_price:.3f} ≥ 1.00 — skip"
+            )
+            return SizingResult(
+                size_usd=0.0,
+                kelly_fraction=0.0,
+                raw_kelly=0.0,
+                adjustments=[f"Effective price {effective_price:.3f} ≥ 1.0 — guaranteed loss after fees"],
+            )
         net_odds = (1.0 - effective_price) / effective_price
         adjustments.append(f"Fee-adj price: {token_price:.3f} → {effective_price:.3f} ({fee_rate:.0%} fee)")
 

@@ -2,7 +2,7 @@
 
 import { useBotContext } from "@/app/providers";
 import { getVoteColor, getVoteDot, cn } from "@/lib/utils";
-import { AGENT_META, type AgentVote, type ConfidenceBreakdown } from "@/lib/types";
+import { AGENT_META, type AgentVote } from "@/lib/types";
 
 function AgentCard({ vote, onUnmute, onMute }: { vote: AgentVote; onUnmute: (agent: string) => void; onMute: (agent: string) => void }) {
   const meta = AGENT_META[vote.agent] || {
@@ -194,54 +194,10 @@ function ConsensusGauge({
   );
 }
 
-function ConfidenceBreakdownBar({ conf }: { conf: ConfidenceBreakdown }) {
-  const components = [
-    { label: "Signal", value: conf.signal_contribution, max: 40, color: "#6366F1" },
-    { label: "Agents", value: conf.agent_contribution, max: 25, color: "#00FF88" },
-    { label: "Delta",  value: conf.delta_contribution,  max: 25, color: "#FACC15" },
-    { label: "Regime", value: conf.regime_contribution, max: 15, color: "#FB923C" },
-    { label: "Momentum", value: conf.momentum_contribution ?? 0, max: 5, color: "#38BDF8" },
-  ];
-  const total = conf.total;
-
-  return (
-    <div className="card p-4 mb-4">
-      <div className="flex justify-between items-center mb-2">
-        <div className="text-xs text-text-secondary">CONFIDENCE BREAKDOWN</div>
-        <div className={cn(
-          "text-lg font-bold font-mono",
-          total >= 65 ? "text-accent-green" : total >= 48 ? "text-yellow-400" : "text-accent-red"
-        )}>{total.toFixed(0)}</div>
-      </div>
-      {/* Stacked bar */}
-      <div className="h-3 rounded-full overflow-hidden flex bg-zinc-800 mb-2">
-        {components.map((c) => (
-          <div
-            key={c.label}
-            style={{ width: `${c.value}%`, background: c.color }}
-            className="h-full transition-all duration-500 first:rounded-l-full last:rounded-r-full"
-            title={`${c.label}: ${c.value.toFixed(1)} pts`}
-          />
-        ))}
-      </div>
-      {/* Legend */}
-      <div className="flex flex-wrap gap-3">
-        {components.map((c) => (
-          <div key={c.label} className="flex items-center gap-1 text-[10px]">
-            <div className="w-2 h-2 rounded-full shrink-0" style={{ background: c.color }} />
-            <span className="text-text-secondary">{c.label}</span>
-            <span className="text-white font-mono">{c.value.toFixed(0)}</span>
-            <span className="text-zinc-600">/{c.max}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
 
 export function AgentPanel() {
   const { state, send } = useBotContext();
-  const { agents, confidence } = state;
+  const { agents } = state;
 
   const handleUnmute = (agentName: string) => {
     send({ command: "unmute_agent", agent: agentName });
@@ -267,8 +223,7 @@ export function AgentPanel() {
         upWeight={agents.up_weight}
         downWeight={agents.down_weight}
       />
-      {confidence && <ConfidenceBreakdownBar conf={confidence} />}
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+<div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
         {agents.votes.map((vote) => (
           <AgentCard key={vote.agent} vote={vote} onUnmute={handleUnmute} onMute={handleMute} />
         ))}

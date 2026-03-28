@@ -77,14 +77,20 @@ class OrderFlowAgent(BaseAgent):
             conviction = abs_imbalance / self.STRONG_IMBALANCE * 0.6
             strength_label = "moderate"
 
-        # Discount if order book conflicts with window delta
-        # (order book could be spoofed, but delta doesn't lie)
+        # Order book is a CONFIRMING signal only — not a contrarian one.
+        # When the book leans against the current window delta, the order book
+        # is just reflecting passive market-maker liquidity replenishment, not
+        # informed directional flow. Abstain rather than fight the delta.
         delta_dir = "UP" if window_delta_pct > 0 else "DOWN" if window_delta_pct < 0 else "NEUTRAL"
         if delta_dir != "NEUTRAL" and delta_dir != vote.value:
-            conviction *= 0.5
-            note = f" (conflicts with delta={window_delta_pct:+.3f}%)"
-        else:
-            note = ""
+            return AgentVote(
+                agent_name=self.name,
+                vote=Vote.ABSTAIN,
+                conviction=0.0,
+                reasoning=(
+                    f"Book {vote.value} conflicts with delta={window_delta_pct:+.3f}% — abstain"
+                ),
+            )
 
         return AgentVote(
             agent_name=self.name,
@@ -92,6 +98,6 @@ class OrderFlowAgent(BaseAgent):
             conviction=min(conviction, 1.0),
             reasoning=(
                 f"Book {strength_label} {vote.value}: "
-                f"imbalance={ob_imbalance:+.3f}{note}"
+                f"imbalance={ob_imbalance:+.3f} (confirms delta)"
             ),
         )

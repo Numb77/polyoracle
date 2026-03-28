@@ -13,7 +13,56 @@ import {
   cn,
 } from "@/lib/utils";
 import { AGENT_META } from "@/lib/types";
-import type { BtcTick, WindowState, Consensus, ConfidenceBreakdown } from "@/lib/types";
+import type { BtcTick, WindowState, Consensus, ConfidenceBreakdown, MarketRegime, TradeResolved } from "@/lib/types";
+
+// ── Confidence breakdown stacked bar ─────────────────────────────────────────
+
+function ConfidenceBreakdownBar({ conf }: { conf: ConfidenceBreakdown }) {
+  const barComponents = [
+    { label: "Signal",      value: conf.signal_contribution,           color: "#6366F1" },
+    { label: "Agents",      value: conf.agent_contribution,            color: "#00FF88" },
+    { label: "Delta",       value: conf.delta_contribution,            color: "#FACC15" },
+    { label: "Regime",      value: conf.regime_contribution,           color: "#FB923C" },
+    { label: "Momentum",    value: conf.momentum_contribution ?? 0,    color: "#38BDF8" },
+    { label: "Persistence", value: conf.persistence_contribution ?? 0, color: "#A78BFA" },
+    { label: "Time Decay",  value: conf.time_decay_contribution ?? 0,  color: "#F472B6" },
+  ];
+  const crossAsset = conf.cross_asset_contribution ?? 0;
+
+  return (
+    <div className="mt-3 pt-3 border-t" style={{ borderColor: "var(--border-color)" }}>
+      <div className="text-xs text-text-secondary mb-2">CONFIDENCE BREAKDOWN</div>
+      <div className="h-2 rounded-full overflow-hidden flex bg-zinc-800 mb-2">
+        {barComponents.map((c) => c.value > 0 && (
+          <div
+            key={c.label}
+            style={{ width: `${c.value}%`, background: c.color }}
+            className="h-full transition-all duration-500"
+            title={`${c.label}: ${c.value.toFixed(1)} pts`}
+          />
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-x-3 gap-y-1">
+        {barComponents.map((c) => c.value > 0 && (
+          <div key={c.label} className="flex items-center gap-1 text-[10px]">
+            <div className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: c.color }} />
+            <span className="text-text-secondary">{c.label}</span>
+            <span className="text-white font-mono">{c.value.toFixed(0)}</span>
+          </div>
+        ))}
+        {crossAsset !== 0 && (
+          <div className="flex items-center gap-1 text-[10px]">
+            <div className={cn("w-1.5 h-1.5 rounded-full shrink-0", crossAsset > 0 ? "bg-emerald-400" : "bg-red-400")} />
+            <span className="text-text-secondary">Cross</span>
+            <span className={cn("font-mono font-bold", crossAsset > 0 ? "text-emerald-400" : "text-red-400")}>
+              {crossAsset > 0 ? "+" : ""}{crossAsset.toFixed(0)}
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 // ── BTC/ETH price sparkline ───────────────────────────────────────────────────
 
@@ -149,6 +198,30 @@ function ConfidenceGauge({ score, shouldTrade }: { score: number; shouldTrade: b
   );
 }
 
+// ── Per-asset session stats ────────────────────────────────────────────────────
+
+function AssetSessionStats({ trades, asset }: { trades: TradeResolved[]; asset: "BTC" | "ETH" }) {
+  const assetTrades = trades.filter((t) => (t.asset ?? (t.market.startsWith("eth") ? "ETH" : "BTC")) === asset);
+  if (assetTrades.length === 0) return null;
+  const wins = assetTrades.filter((t) => t.won).length;
+  const losses = assetTrades.length - wins;
+  const pnl = assetTrades.reduce((acc, t) => acc + t.pnl, 0);
+  const wr = (wins / assetTrades.length) * 100;
+  return (
+    <div className="mt-3 pt-3 border-t flex items-center gap-4 text-[10px] font-mono"
+         style={{ borderColor: "var(--border-color)" }}>
+      <span className="text-text-secondary">SESSION</span>
+      <span className="text-accent-green">{wins}W</span>
+      <span className="text-accent-red">{losses}L</span>
+      <span className="text-text-secondary">·</span>
+      <span className={pnl >= 0 ? "text-accent-green" : "text-accent-red"}>
+        {pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}
+      </span>
+      <span className="text-text-secondary ml-auto">{wr.toFixed(0)}% WR</span>
+    </div>
+  );
+}
+
 // ── Main MarketCard ───────────────────────────────────────────────────────────
 
 interface MarketCardProps {
@@ -162,6 +235,7 @@ export function MarketCard({ asset = "BTC" }: MarketCardProps) {
   const ticks: BtcTick[] = asset === "ETH" ? state.ethTicks : state.ticks;
   const confidence: ConfidenceBreakdown | null = asset === "ETH" ? state.ethConfidence : state.confidence;
   const agents: Consensus | null = asset === "ETH" ? state.ethAgents : state.agents;
+  const { recentTrades } = state;
 
   const assetLabel = asset === "ETH" ? "Ethereum" : "Bitcoin";
   const assetColor = asset === "ETH" ? "text-indigo-400" : "text-accent-green";
@@ -264,57 +338,92 @@ export function MarketCard({ asset = "BTC" }: MarketCardProps) {
           </div>
         </div>
 
-        {/* Confidence gauge */}
+        {/* Confidence gauge + breakdown + agent consensus — one block */}
         {confidence && (
           <div className="mb-4 p-3 rounded-lg bg-zinc-900/60 border border-zinc-800">
             <ConfidenceGauge score={confScore} shouldTrade={confidence.should_trade} />
+
+            {/* Agent consensus dots */}
+            {agents && (
+              <div className="mt-3 pt-3 border-t" style={{ borderColor: "var(--border-color)" }}>
+                <div className="text-xs text-text-secondary mb-2">AGENT CONSENSUS</div>
+                <div className="flex items-center gap-3">
+                  <div className="flex gap-2">
+                    {agents.votes.map((vote) => {
+                      const meta = AGENT_META[vote.agent] || { emoji: "?", label: vote.agent };
+                      const tooltip = [
+                        `${meta.label}: ${vote.vote}`,
+                        vote.reasoning ? vote.reasoning : null,
+                        `conviction ${(vote.conviction * 100).toFixed(0)}% · acc ${(vote.accuracy * 100).toFixed(0)}%`,
+                      ].filter(Boolean).join("\n");
+                      return (
+                        <div
+                          key={vote.agent}
+                          className="flex flex-col items-center gap-1 cursor-help"
+                          title={tooltip}
+                        >
+                          <div className={cn("w-2.5 h-2.5 rounded-full", getVoteDot(vote.vote as "UP" | "DOWN" | "ABSTAIN"))} />
+                          <span className="text-xs">{meta.emoji}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="ml-auto text-xs">
+                    <span className={
+                      agents.direction === "UP" ? "text-accent-green font-bold" :
+                      agents.direction === "DOWN" ? "text-accent-red font-bold" :
+                      "text-text-secondary"
+                    }>
+                      {agents.direction}
+                    </span>
+                    <span className="text-text-secondary ml-1">
+                      {(agents.agreement_ratio * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <ConfidenceBreakdownBar conf={confidence} />
           </div>
         )}
 
-        {/* Agent consensus dots */}
-        {agents && (
-          <div>
-            <div className="text-xs text-text-secondary mb-2">AGENT CONSENSUS</div>
-            <div className="flex items-center gap-3">
-              <div className="flex gap-2">
-                {agents.votes.map((vote) => {
-                  const meta = AGENT_META[vote.agent] || { emoji: "?", label: vote.agent };
-                  return (
-                    <div
-                      key={vote.agent}
-                      className="flex flex-col items-center gap-1"
-                      title={`${meta.label}: ${vote.vote}`}
-                    >
-                      <div
-                        className={cn(
-                          "w-2.5 h-2.5 rounded-full",
-                          getVoteDot(vote.vote as "UP" | "DOWN" | "ABSTAIN")
-                        )}
-                      />
-                      <span className="text-xs">{meta.emoji}</span>
-                    </div>
-                  );
-                })}
-              </div>
-              <div className="ml-auto text-xs">
-                <span
-                  className={
-                    agents.direction === "UP"
-                      ? "text-accent-green font-bold"
-                      : agents.direction === "DOWN"
-                      ? "text-accent-red font-bold"
-                      : "text-text-secondary"
-                  }
-                >
-                  {agents.direction}
+        {/* Market regime + oracle status */}
+        {(win.market_regime || win.oracle_latency_sec != null) && (
+          <div className="flex items-center gap-2 mb-4 text-[10px] font-mono">
+            {win.market_regime && (() => {
+              const regime = win.market_regime as MarketRegime;
+              const regimeColor =
+                regime === "TRENDING" ? "text-accent-green border-accent-green/30" :
+                regime === "VOLATILE" ? "text-yellow-400 border-yellow-400/30" :
+                "text-zinc-500 border-zinc-700";
+              const regimeEmoji =
+                regime === "TRENDING" ? "↗" : regime === "VOLATILE" ? "⚡" : "—";
+              return (
+                <span className={cn("border rounded px-1.5 py-0.5", regimeColor)}>
+                  {regimeEmoji} {regime}
+                  {win.regime_trend_strength != null && win.regime_trend_strength > 0
+                    ? ` ${(win.regime_trend_strength * 100).toFixed(0)}%`
+                    : ""}
                 </span>
-                <span className="text-text-secondary ml-1">
-                  {(agents.agreement_ratio * 100).toFixed(0)}%
-                </span>
-              </div>
-            </div>
+              );
+            })()}
+            {win.oracle_latency_sec != null && (
+              <span className={cn(
+                "border rounded px-1.5 py-0.5",
+                win.oracle_latency_sec > 300
+                  ? "text-yellow-400 border-yellow-400/30"
+                  : "text-zinc-600 border-zinc-700"
+              )}>
+                ⬡ oracle {win.oracle_latency_sec > 60
+                  ? `${Math.floor(win.oracle_latency_sec / 60)}m`
+                  : `${win.oracle_latency_sec.toFixed(0)}s`} ago
+              </span>
+            )}
           </div>
         )}
+
+        <AssetSessionStats trades={recentTrades} asset={asset} />
       </div>
     </div>
   );

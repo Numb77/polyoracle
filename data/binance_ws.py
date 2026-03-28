@@ -201,9 +201,10 @@ async def get_window_open_price(symbol: str, window_ts: int) -> float:
     """
     Fetch the open price for a 5-minute window from Binance klines.
 
-    Uses the klines endpoint to get the precise open price at the window start
-    (window_ts is a Unix timestamp aligned to a 300-second boundary).
-    This is the authoritative open price regardless of when the bot started.
+    Queries the PREVIOUS completed 5-minute candle (the one that just closed at
+    window_ts) and returns its close price, which equals the current window's open.
+    This avoids a timing race where Binance REST hasn't yet indexed the candle
+    that literally just opened — causing a "no kline data" miss every window.
     """
     import aiohttp
 
@@ -211,8 +212,7 @@ async def get_window_open_price(symbol: str, window_ts: int) -> float:
     params = {
         "symbol": symbol,
         "interval": "5m",
-        "startTime": window_ts * 1000,         # ms
-        "endTime": (window_ts + 300) * 1000,   # ms
+        "endTime": window_ts * 1000 - 1,   # 1 ms before window open = previous candle
         "limit": 1,
     }
     try:
@@ -223,7 +223,8 @@ async def get_window_open_price(symbol: str, window_ts: int) -> float:
                 data = await resp.json()
                 if data and isinstance(data, list) and len(data) > 0:
                     # kline format: [openTime, open, high, low, close, ...]
-                    return float(data[0][1])
+                    # close (index 4) of the previous candle = open of current window
+                    return float(data[0][4])
                 logger.warning(f"No kline data for {symbol} window_ts={window_ts}")
                 return 0.0
     except Exception as exc:
@@ -234,3 +235,51 @@ async def get_window_open_price(symbol: str, window_ts: int) -> float:
 async def get_btc_window_open_price(window_ts: int) -> float:
     """Backwards-compatible alias for get_window_open_price('BTCUSDT', ...)."""
     return await get_window_open_price("BTCUSDT", window_ts)
+
+
+async def get_window_close_price(symbol: str, window_ts: int) -> float:
+    """
+    Fetch the exact close price of the 5-minute window that started at window_ts.
+
+    The window closes at window_ts + 300.  The Binance kline for that window
+    may not be indexed immediately — we retry up to 6 times (30 s total) to
+    give the exchange time to publish the closed candle.
+    """
+    import aiohttp
+
+    url = f"{cfg.binance_rest_url}/api/v3/klines"
+    # Query the candle whose openTime == window_ts (the window that just closed).
+    # We use startTime / endTime to pin the exact candle rather than asking for
+    # the latest one (which could be the NEW open window).
+    params = {
+        "symbol": symbol,
+        "interval": "5m",
+        "startTime": window_ts * 1000,
+        "endTime": (window_ts + 300) * 1000 - 1,
+        "limit": 1,
+    }
+
+    for attempt in range(6):   # retry up to ~30 s
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    data = await resp.json()
+                    if data and isinstance(data, list) and len(data) > 0:
+                        close_price = float(data[0][4])  # index 4 = close
+                        logger.debug(
+                            f"Binance kline close for {symbol} "
+                            f"window_ts={window_ts}: {close_price}"
+                        )
+                        return close_price
+        except Exception as exc:
+            logger.warning(f"get_window_close_price attempt {attempt+1}: {exc}")
+
+        if attempt < 5:
+            await asyncio.sleep(5)
+
+    logger.warning(
+        f"get_window_close_price: no kline for {symbol} window_ts={window_ts} after retries"
+    )
+    return 0.0

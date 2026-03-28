@@ -54,6 +54,30 @@ class VolatilityAgent(BaseAgent):
         if current_atr == 0.0 and len(df_1m) >= 15:
             current_atr = atr(df_1m, period=14)
 
+        # ── No ATR data yet (early window, < 14 candles) ─────────────────────
+        # Fall back to raw delta magnitude so the agent doesn't blind-abstain
+        # during the first 2-3 minutes when ATR is unavailable.
+        if current_atr == 0.0:
+            if abs(window_delta_pct) >= 0.05:
+                direction = Vote.UP if window_delta_pct > 0 else Vote.DOWN
+                # Conviction scales with delta; 0.20%+ = max conviction
+                conviction = min(abs(window_delta_pct) / 0.20, 0.85)
+                return AgentVote(
+                    agent_name=self.name,
+                    vote=direction,
+                    conviction=conviction,
+                    reasoning=(
+                        f"No ATR yet — delta-only {direction.value}: "
+                        f"delta={window_delta_pct:+.3f}%"
+                    ),
+                )
+            return AgentVote(
+                agent_name=self.name,
+                vote=Vote.ABSTAIN,
+                conviction=0.0,
+                reasoning=f"No ATR data and delta too small ({window_delta_pct:+.3f}%)",
+            )
+
         # ── Signal-to-noise ratio: delta relative to current volatility ──────
         # A small delta in a dead-flat market can be more meaningful than
         # a large delta in a noisy, high-vol market.

@@ -45,6 +45,41 @@ class PolymarketExecutor:
         self._fees = fee_calculator
         self._is_paper = cfg.paper_mode
         self._clob_client = None
+        # Guards against concurrent fill-poll tasks spawning duplicate reprice ops.
+        # _poll_running: only one check_and_update_fills runs at a time per executor.
+        # _repricing: set of order_ids currently being cancelled+replaced; skip if seen again.
+        self._poll_running = False
+        self._repricing: set[str] = set()
+
+    @staticmethod
+    def _compute_fill_vwap(asks: list, size_usd: float) -> tuple[float, float]:
+        """
+        Compute the volume-weighted average price (VWAP) a FOK market order would
+        achieve when sweeping the ask side of the book for a given USD spend.
+
+        Returns (vwap, total_available_usd).
+
+        - vwap: average price per share across all levels consumed by this order.
+          Compared against max_fair_ask to detect when sweeping the book loses edge.
+        - total_available_usd: total USDC value of all asks at or below the sweep.
+          Used to detect thin books where a FOK would only partially fill.
+        """
+        remaining = size_usd
+        total_shares = 0.0
+        total_depth_usd = 0.0
+        for ask in sorted(asks, key=lambda a: float(a["price"])):
+            price = float(ask["price"])
+            avail_shares = float(ask.get("size", ask.get("quantity", 0)))
+            avail_usd = price * avail_shares
+            total_depth_usd += avail_usd
+            if remaining > 0:
+                fill_usd = min(remaining, avail_usd)
+                total_shares += fill_usd / price
+                remaining -= fill_usd
+        if total_shares == 0:
+            return 1.0, 0.0
+        actual_spent = size_usd - remaining
+        return actual_spent / total_shares, total_depth_usd
 
     def _get_clob_client(self):
         """Get or create the CLOB client."""
@@ -129,6 +164,35 @@ class PolymarketExecutor:
                 f"(min: {cfg.min_trade_shares})"
             )
             return None
+
+        # ── Book depth + VWAP check (live FOK only) ──────────────────────────
+        # best_ask is the TOP of the book. A FOK sweeps through multiple levels,
+        # so the actual average fill price (VWAP) is always >= best_ask.
+        # If the book is too thin or the VWAP sweeps past max_fair_ask, skip —
+        # we'd be paying more per share than our edge allows, and the win payout
+        # (actual_shares × $1) might not cover what we spent.
+        if not self._is_paper:
+            try:
+                from data.polymarket_rest import PolymarketRestClient
+                async with PolymarketRestClient() as rest:
+                    book = await rest.get_order_book(token_id)
+                asks = book.get("asks", [])
+                if asks:
+                    vwap, total_depth_usd = self._compute_fill_vwap(asks, position_size_usd)
+                    if total_depth_usd < position_size_usd:
+                        logger.info(
+                            f"Insufficient depth: ${total_depth_usd:.2f} available "
+                            f"< ${position_size_usd:.2f} order size — skip"
+                        )
+                        return None
+                    if vwap > max_fair_ask:
+                        logger.info(
+                            f"Sweep VWAP={vwap:.3f} > max fair={max_fair_ask:.3f} "
+                            f"— filling full order loses edge, skip"
+                        )
+                        return None
+            except Exception as exc:
+                logger.debug(f"FOK depth/VWAP check failed (non-blocking): {exc}")
 
         # ── Execute ───────────────────────────────────────────────────────────
         if self._is_paper:
@@ -247,7 +311,19 @@ class PolymarketExecutor:
 
                 if result and result.get("orderID"):
                     real_order_id = result["orderID"]
-                    filled_shares = round(amount / price, 4)
+                    # Prefer the actual matched size from the API response.
+                    # Polymarket returns size_matched (or takerAmount in some versions)
+                    # reflecting the true shares received after sweeping the book.
+                    # Fall back to the estimate (amount / price) if not present.
+                    raw_matched = (
+                        result.get("size_matched")
+                        or result.get("sizeMatched")
+                        or result.get("takerAmount")
+                    )
+                    if raw_matched:
+                        filled_shares = round(float(raw_matched), 4)
+                    else:
+                        filled_shares = round(amount / price, 4)
 
                     self._orders._active.pop(order_id, None)
                     order.order_id = real_order_id
@@ -274,20 +350,32 @@ class PolymarketExecutor:
                     "no match", "no asks", "book.asks is none",
                 ))
                 is_depth = any(k in exc_str for k in (
-                    "couldn't be fully filled", "insufficient", "not enough"
+                    "couldn't be fully filled", "insufficient", "not enough",
+                    "fully filled or killed", "fok", "400",
                 ))
                 is_timeout = "timeout" in exc_str or "readtimeout" in exc_str
+                is_tls_early = "425" in str(exc)
 
                 if is_no_liquidity:
                     # Empty order book — retrying won't help
                     logger.info("FOK skipped — no asks in order book (illiquid market)")
                     break
+                elif is_tls_early and attempt == 0:
+                    # HTTP 425: TLS 1.3 0-RTT early-data rejected — retry immediately
+                    logger.debug("FOK got HTTP 425 (TLS early-data) — retrying once")
+                    await asyncio.sleep(0.5)
+                    continue
                 elif is_depth and attempt == 0:
                     logger.info(
                         f"FOK insufficient depth at ${amount:.2f} — "
                         f"retrying at ${amounts_to_try[1]:.2f}"
                     )
                     continue
+                elif is_depth:
+                    # Second attempt FOK kill — expected, not an error
+                    logger.info(
+                        f"FOK killed at reduced ${amount:.2f} — insufficient depth, skipping"
+                    )
                 elif is_timeout:
                     logger.error(f"FOK timeout on attempt {attempt+1}: {exc}")
                 else:
@@ -373,8 +461,10 @@ class PolymarketExecutor:
 
         # Skip if our bid is too far below the current ask — the order will
         # rest the entire window unfilled (market has priced in the move).
-        # 10¢ threshold: allows near-50% markets, blocks ask=0.99/bid=0.55 gaps.
-        MAX_GTC_SPREAD = 0.10
+        # Widened to 0.18: early-window books naturally have wide spreads
+        # (ask=0.65, bid=0.52 is a 0.13 gap but the order will fill as sellers
+        # reprice downward if direction reverses). 0.20+ still means no edge.
+        MAX_GTC_SPREAD = 0.18
         if best_ask is not None and best_ask > 0 and (best_ask - bid_price) > MAX_GTC_SPREAD:
             logger.info(
                 f"GTC spread too wide: ask={best_ask:.3f} bid={bid_price:.3f} "
@@ -514,27 +604,38 @@ class PolymarketExecutor:
             self._orders.mark_cancelled(order_id, "CLOB client unavailable")
             return None
 
-        try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, self._place_gtc_sync, client, token_id, bid_price, size_shares
-            )
-            if result and result.get("orderID"):
-                real_order_id = result["orderID"]
-                # Update the order record with the exchange-assigned ID
-                self._orders._active.pop(order_id, None)
-                order.order_id = real_order_id
-                self._orders._active[real_order_id] = order
-
-                logger.trade(  # type: ignore[attr-defined]
-                    f"[LIVE-GTC] {direction} {outcome} {market.slug[:20]}... "
-                    f"@ bid={bid_price:.3f} × {size_shares:.1f} shares = ${size_usd:.2f} "
-                    f"[{real_order_id[:12]}...] (resting — awaiting fill)"
+        for attempt in range(2):
+            try:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, self._place_gtc_sync, client, token_id, bid_price, size_shares
                 )
-                return order
-            else:
-                logger.warning(f"GTC order returned no orderID: {result}")
-        except Exception as exc:
-            logger.error(f"GTC order failed: {exc}", exc_info=True)
+                if result and result.get("orderID"):
+                    real_order_id = result["orderID"]
+                    # Update the order record with the exchange-assigned ID
+                    self._orders._active.pop(order_id, None)
+                    order.order_id = real_order_id
+                    self._orders._active[real_order_id] = order
+
+                    logger.trade(  # type: ignore[attr-defined]
+                        f"[LIVE-GTC] {direction} {outcome} {market.slug[:20]}... "
+                        f"@ bid={bid_price:.3f} × {size_shares:.1f} shares = ${size_usd:.2f} "
+                        f"[{real_order_id[:12]}...] (resting — awaiting fill)"
+                    )
+                    return order
+                else:
+                    logger.warning(f"GTC order returned no orderID: {result}")
+                break
+            except Exception as exc:
+                exc_str = str(exc)
+                # HTTP 425 "Too Early" is a TLS 1.3 0-RTT early-data rejection —
+                # the server refuses the first request on a resumed session.
+                # Retry once immediately with a fresh connection; it always works.
+                if "425" in exc_str and attempt == 0:
+                    logger.debug("GTC order got HTTP 425 (TLS early-data) — retrying once")
+                    await asyncio.sleep(0.5)
+                    continue
+                logger.error(f"GTC order failed: {exc}", exc_info=True)
+                break
 
         self._orders.mark_cancelled(order_id, "GTC placement failed")
         return None
@@ -639,93 +740,177 @@ class PolymarketExecutor:
         except Exception as exc:
             logger.debug(f"Fee rate fetch failed, using cached/default: {exc}")
 
-    async def check_and_update_fills(self) -> list[str]:
+    async def check_and_update_fills(self) -> tuple[list[str], list[str]]:
         """
         Poll active live orders for fill status.  Call this periodically so the
         bot knows about fills before window close (and logs progress).
 
-        Returns list of order IDs that were newly marked as filled.
+        Returns (newly_filled_ids, newly_cancelled_ids).
+        Cancelled IDs are orders dropped mid-poll (no-edge cancel or reprice
+        cancel where the replacement failed) — caller must push trade_cancelled
+        to the dashboard so the UI removes them from activePositions.
+
+        Guard: if a previous call is still in-flight (async I/O takes longer than
+        the 5s poll interval), skip this call entirely.  Without this guard,
+        concurrent calls each reprice the same order → multiple orders placed.
         """
-        newly_filled = []
+        if self._poll_running:
+            return [], []
+        self._poll_running = True
+        newly_filled: list[str] = []
+        newly_cancelled: list[str] = []
         client = self._get_clob_client()
         if client is None:
-            return newly_filled
+            self._poll_running = False
+            return [], []
+        try:
 
-        for order in list(self._orders.get_active_orders()):
-            if order.is_paper:
-                continue
-            try:
-                status = await asyncio.get_event_loop().run_in_executor(
-                    None, client.get_order, order.order_id
-                )
-                if not status:
+            for order in list(self._orders.get_active_orders()):
+                if order.is_paper:
                     continue
-                order_status = status.get("status", "")
-                if order_status == "MATCHED":
+                try:
+                    status = await asyncio.get_event_loop().run_in_executor(
+                        None, client.get_order, order.order_id
+                    )
+                    if not status:
+                        continue
+                    order_status = status.get("status", "")
                     filled_price = float(status.get("price", order.price))
-                    size_matched = float(status.get("size_matched", order.size_shares))
-                    self._orders.mark_filled(order.order_id, size_matched, filled_price)
-                    logger.trade(  # type: ignore[attr-defined]
-                        f"[GTC FILLED] {order.direction} {order.outcome} "
-                        f"{order.market_slug[:20]}... @ {filled_price:.3f} "
-                        f"× {size_matched:.1f} shares"
+                    raw_matched = (
+                        status.get("size_matched")
+                        or status.get("sizeMatched")
+                        or "0"
                     )
-                    newly_filled.append(order.order_id)
-                else:
-                    logger.debug(
-                        f"GTC {order.order_id[:12]}... still {order_status} "
-                        f"({order.direction} @ {order.price:.3f})"
-                    )
-                    # ── Dynamic repricing ──────────────────────────────────────
-                    # If the best ask has moved since we placed the order,
-                    # cancel and re-place at the new price so we stay competitive.
-                    await self._reprice_gtc_if_needed(order, client)
-            except Exception as exc:
-                logger.debug(f"Fill poll failed for {order.order_id[:12]}...: {exc}")
+                    size_matched_poll = float(raw_matched) if raw_matched else 0.0
 
-        return newly_filled
+                    if order_status == "MATCHED":
+                        size_matched = float(status.get("size_matched", order.size_shares))
+                        self._orders.mark_filled(order.order_id, size_matched, filled_price)
+                        logger.trade(  # type: ignore[attr-defined]
+                            f"[GTC FILLED] {order.direction} {order.outcome} "
+                            f"{order.market_slug[:20]}... @ {filled_price:.3f} "
+                            f"× {size_matched:.1f} shares"
+                        )
+                        newly_filled.append(order.order_id)
+                    elif size_matched_poll > 0:
+                        # Partially filled — accept what we have, do NOT reprice.
+                        # Repricing after a partial fill would place a second full-size
+                        # order on top of the existing partial, doubling our exposure.
+                        self._orders.mark_filled(order.order_id, size_matched_poll, filled_price)
+                        logger.trade(  # type: ignore[attr-defined]
+                            f"[GTC PARTIAL] {order.direction} {order.outcome} "
+                            f"{order.market_slug[:20]}... @ {filled_price:.3f} "
+                            f"× {size_matched_poll:.1f} shares (partial, skip reprice)"
+                        )
+                        newly_filled.append(order.order_id)
+                    else:
+                        logger.debug(
+                            f"GTC {order.order_id[:12]}... still {order_status} "
+                            f"({order.direction} @ {order.price:.3f})"
+                        )
+                        # ── Dynamic repricing ──────────────────────────────────────
+                        # If the best ask has moved since we placed the order,
+                        # cancel and re-place at the new price so we stay competitive.
+                        was_cancelled = await self._reprice_gtc_if_needed(order, client)
+                        if was_cancelled:
+                            newly_cancelled.append(order.order_id)
+                except Exception as exc:
+                    logger.debug(f"Fill poll failed for {order.order_id[:12]}...: {exc}")
 
-    async def _reprice_gtc_if_needed(self, order, client) -> None:
+        except Exception as exc:
+            logger.debug(f"check_and_update_fills error: {exc}")
+        finally:
+            self._poll_running = False
+
+        return newly_filled, newly_cancelled
+
+    async def _reprice_gtc_if_needed(self, order, client) -> bool:
         """
         Cancel and re-place a GTC order if the ask has moved enough to warrant
         a better bid price.  Keeps the order competitive without human intervention.
 
         Rules:
-          - Bid AT the ask when ask ≤ original confidence cap (we have edge → fill immediately)
-          - Bid ask-0.01 when ask moved up but gap ≤ MAX_SPREAD (track the market)
+          - Hard cap: never bid above confidence/100. Above that price the trade
+            has negative expected value (paying more than our probability estimate).
+            If the ask has risen past our confidence cap, cancel and walk away —
+            the FOK path will handle the deadline if there's still time.
+          - Bid AT the ask when ask ≤ confidence_cap (we have edge → fill immediately)
+          - Bid ask-0.01 when ask above our original entry but ≤ confidence_cap
           - Do nothing if new bid == current bid (already optimal)
-          - Do nothing if gap > MAX_SPREAD (market moved too far, let spread-check handle it)
+
+        Guard: if this order_id is already being repriced (cancel+replace in-flight),
+        skip silently.  Without this a second concurrent poll cycle could see the
+        same order before mark_cancelled() runs and launch a second reprice.
         """
-        MAX_GTC_SPREAD = 0.10
+        if order.order_id in self._repricing:
+            return False
+        self._repricing.add(order.order_id)
+        cancelled_permanently = False
         try:
-            # Fetch current ask directly via REST order book
             loop = asyncio.get_event_loop()
+
+            # Safety check: re-query the order before cancelling.
+            # Between the fill-poll GET and now, the order may have partially filled.
+            # A partial fill + new full-size order = double exposure.
+            pre_cancel_status = await loop.run_in_executor(
+                None, client.get_order, order.order_id
+            )
+            if pre_cancel_status:
+                raw = (
+                    pre_cancel_status.get("size_matched")
+                    or pre_cancel_status.get("sizeMatched")
+                    or "0"
+                )
+                pre_matched = float(raw) if raw else 0.0
+                if pre_matched > 0:
+                    # Already partially (or fully) filled — accept, no reprice
+                    fp = float(pre_cancel_status.get("price", order.price))
+                    self._orders.mark_filled(order.order_id, pre_matched, fp)
+                    logger.info(
+                        f"GTC {order.order_id[:12]}... pre-cancel fill detected "
+                        f"({pre_matched:.1f} shares @ {fp:.3f}) — skip reprice"
+                    )
+                    return False
+
+            # Fetch current ask directly via REST order book
             book = await loop.run_in_executor(
                 None, client.get_order_book, order.token_id
             )
             if not book or not book.asks:
-                return
+                return False
 
             new_ask = round(min(float(a.price) for a in book.asks), 2)
             if new_ask <= 0:
-                return
+                return False
 
-            # Compute new bid (same logic as execute_gtc)
-            confidence_cap = order.price  # price stored at placement = confidence/100
-            if new_ask <= confidence_cap:
-                new_bid = new_ask          # aggressive: cross spread for immediate fill
-            else:
-                new_bid = round(new_ask - 0.01, 2)   # passive: just below ask
+            # Hard cap: confidence/100 is the maximum we should ever pay.
+            # Above this price the EV is negative regardless of fill speed.
+            confidence_cap = round(order.confidence / 100, 2)
 
+            if new_ask > confidence_cap:
+                # Market has moved past our edge — cancel and don't re-enter.
+                # The deadline FOK pass will take over with fresh evaluation.
+                await asyncio.get_event_loop().run_in_executor(
+                    None, client.cancel, order.order_id
+                )
+                self._orders.mark_cancelled(order.order_id, "Ask above confidence cap — no edge")
+                logger.info(
+                    f"GTC cancelled (no edge): {order.market_slug[:20]}... "
+                    f"ask={new_ask:.3f} > conf_cap={confidence_cap:.3f}"
+                )
+                cancelled_permanently = True
+                return True
+
+            if new_ask <= order.price:
+                return False  # Ask came back down or hasn't moved — order is still competitive
+
+            # Ask has risen but is still within our edge threshold.
+            # Reprice to new_ask (cross spread) for immediate fill.
+            new_bid = new_ask
             new_bid = round(round(new_bid / 0.01) * 0.01, 2)
-            new_bid = max(0.51, min(0.98, new_bid))
-
-            gap = new_ask - new_bid
-            if gap > MAX_GTC_SPREAD:
-                return  # Market moved too far — not worth repricing
 
             if abs(new_bid - order.price) < 0.01:
-                return  # Already at optimal price — no change needed
+                return False  # Already at optimal price — no change needed
 
             # Cancel old order
             await asyncio.get_event_loop().run_in_executor(
@@ -756,8 +941,16 @@ class PolymarketExecutor:
                     f"GTC repriced: {order.market_slug[:20]}... "
                     f"{order.price:.3f} → {new_bid:.3f} (ask={new_ask:.3f})"
                 )
+            else:
+                # Replacement failed — old order is already cancelled. Signal to
+                # caller so it can push trade_cancelled to the dashboard.
+                cancelled_permanently = True
+            return cancelled_permanently
         except Exception as exc:
             logger.debug(f"GTC reprice check failed for {order.order_id[:12]}...: {exc}")
+            return False
+        finally:
+            self._repricing.discard(order.order_id)
 
     async def cancel_all_open(self) -> list:
         """

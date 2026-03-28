@@ -98,8 +98,14 @@ class PnlTracker:
         entry_price: float,
         confidence: float,
         window_ts: int,
+        closed_at: float | None = None,
     ) -> None:
-        """Record a completed trade."""
+        """Record a completed trade.
+
+        closed_at: override the timestamp used for daily-loss bucketing.
+        Pass the historical window close time when recording old trades at
+        startup so they don't count against today's daily loss limit.
+        """
         record = TradeRecord(
             trade_id=trade_id,
             direction=direction,
@@ -109,6 +115,8 @@ class PnlTracker:
             confidence=confidence,
             window_ts=window_ts,
         )
+        if closed_at is not None:
+            record.closed_at = closed_at
         self._trades.append(record)
         self._pnl_per_trade.append(pnl)
 

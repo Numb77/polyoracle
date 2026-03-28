@@ -91,7 +91,7 @@ class MetaLearner:
     WINDOW_SIZE = 50            # Rolling window of trades
     MUTE_THRESHOLD = 0.45       # Below this → muted
     BONUS_THRESHOLD = 0.60      # Above this → weight bonus
-    MIN_TRADES_FOR_WEIGHT = 10  # Don't adjust weight until N trades
+    MIN_TRADES_FOR_WEIGHT = 20  # Don't adjust weight until N trades — needs enough data
     SESSION_MIN_TRADES = 5      # Minimum trades in a bucket before using its accuracy
     SESSION_BLEND = 0.3         # Weight given to session accuracy vs global (max)
     STATE_FILE = "logs/meta_learner.json"
@@ -216,13 +216,24 @@ class MetaLearner:
             stats.weight = 1.0
             stats.is_muted = False
         elif effective_accuracy < self.MUTE_THRESHOLD:
-            # Poor accuracy (global + session blend) — mute
-            stats.weight = 0.0
-            stats.is_muted = True
-            logger.warning(
-                f"Agent {agent_name} muted: effective_accuracy={effective_accuracy:.1%} "
-                f"(below {self.MUTE_THRESHOLD:.0%})"
-            )
+            # Poor accuracy (global + session blend) — mute, but only fully below 40%.
+            # Between 40-45%: reduce weight to 0.3 (dampens signal, not silenced).
+            # Fully mute below 40%: these agents are actively harmful.
+            if effective_accuracy < 0.40:
+                stats.weight = 0.0
+                stats.is_muted = True
+                logger.warning(
+                    f"Agent {agent_name} fully muted: effective_accuracy={effective_accuracy:.1%} "
+                    f"(below 40%)"
+                )
+            else:
+                stats.weight = 0.3
+                stats.is_muted = False
+                logger.warning(
+                    f"Agent {agent_name} weight reduced to 0.3: "
+                    f"effective_accuracy={effective_accuracy:.1%} "
+                    f"(below {self.MUTE_THRESHOLD:.0%})"
+                )
         elif effective_accuracy >= self.BONUS_THRESHOLD:
             # High accuracy — give weight bonus
             bonus = (effective_accuracy - self.BONUS_THRESHOLD) / (1.0 - self.BONUS_THRESHOLD)

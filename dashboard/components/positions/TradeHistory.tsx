@@ -6,20 +6,17 @@ import { formatTimestamp, cn } from "@/lib/utils";
 import { AGENT_META } from "@/lib/types";
 import type { ActivePosition, TradeResolved, AgentVote } from "@/lib/types";
 
-// ── Live elapsed timer ────────────────────────────────────────────────────────
+// ── Live countdown to window close ────────────────────────────────────────────
 
-function useElapsed(openedAt: number) {
-  const [elapsed, setElapsed] = useState(
-    Math.floor((Date.now() - openedAt) / 1000)
-  );
+function useWindowCountdown(windowTs: number) {
+  const windowCloseTs = (windowTs + 300) * 1000; // ms
+  const calc = () => Math.max(0, Math.floor((windowCloseTs - Date.now()) / 1000));
+  const [remaining, setRemaining] = useState(calc);
   useEffect(() => {
-    const id = setInterval(
-      () => setElapsed(Math.floor((Date.now() - openedAt) / 1000)),
-      1000
-    );
+    const id = setInterval(() => setRemaining(calc), 1000);
     return () => clearInterval(id);
-  }, [openedAt]);
-  return elapsed;
+  }, [windowTs]);
+  return remaining;
 }
 
 // ── Market label helper ────────────────────────────────────────────────────────
@@ -203,16 +200,20 @@ function TradeDetailModal({ trade, onClose }: { trade: TradeResolved; onClose: (
 // ── Active position card ──────────────────────────────────────────────────────
 
 function ActivePositionCard({ pos }: { pos: ActivePosition }) {
-  const elapsed = useElapsed(pos.opened_at);
-  const mins = Math.floor(elapsed / 60);
-  const secs = elapsed % 60;
+  const remaining = useWindowCountdown(pos.window_ts);
+  const mins = Math.floor(remaining / 60);
+  const secs = remaining % 60;
   const asset = pos.asset ?? (pos.market.startsWith("eth") ? "ETH" : "BTC");
+  // Window has closed when countdown reaches 0
+  const isStale = remaining === 0;
 
   return (
     <div
       className={cn(
         "slide-in flex items-center gap-3 p-3 rounded-lg border transition-all",
-        pos.direction === "UP"
+        isStale
+          ? "border-zinc-600/50 bg-zinc-800/40 opacity-60"
+          : pos.direction === "UP"
           ? "border-accent-green/30 bg-accent-green/5"
           : "border-accent-red/30 bg-accent-red/5"
       )}
@@ -246,13 +247,21 @@ function ActivePositionCard({ pos }: { pos: ActivePosition }) {
         </div>
       </div>
 
-      {/* Elapsed */}
+      {/* Countdown to window close */}
       <div className="text-right shrink-0">
-        <div className="text-xs font-mono text-yellow-400">
-          {mins > 0 ? `${mins}m ` : ""}{secs}s
-        </div>
-        <div className="text-[10px] text-zinc-600 font-mono">
-          {pos.order_id.slice(0, 10)}...
+        {isStale ? (
+          <div className="text-xs font-mono text-zinc-500">CLOSED</div>
+        ) : (
+          <div className={cn(
+            "text-xs font-mono tabular-nums font-bold",
+            remaining < 10 ? "text-accent-red animate-pulse" :
+            remaining < 30 ? "text-yellow-400" : "text-white"
+          )}>
+            {mins > 0 ? `${mins}:${String(secs).padStart(2, "0")}` : `${secs}s`}
+          </div>
+        )}
+        <div className="text-[10px] text-zinc-600 font-mono mt-0.5">
+          {isStale ? pos.order_id.slice(0, 10) + "..." : "left"}
         </div>
       </div>
     </div>
@@ -316,13 +325,31 @@ export function TradeHistory() {
   const { recentTrades } = state;
   const activePositions = [...state.activePositions, ...state.ethActivePositions];
 
+  const { lastClaimsRecovery } = state;
+
   const [selectedTrade, setSelectedTrade] = useState<TradeResolved | null>(null);
   const [collecting, setCollecting] = useState(false);
+
+  // Reset "collecting" state when the bot sends back a recovery result
+  useEffect(() => {
+    if (lastClaimsRecovery !== null) {
+      setCollecting(false);
+    }
+  }, [lastClaimsRecovery]);
 
   function handleCollectClaims() {
     setCollecting(true);
     send({ command: "collect_claims" });
-    setTimeout(() => setCollecting(false), 4000);
+  }
+
+  function claimButtonLabel(): string {
+    if (collecting) return "COLLECTING…";
+    if (lastClaimsRecovery) {
+      const { recovered_count, recovered_usd } = lastClaimsRecovery;
+      if (recovered_count > 0) return `✓ +$${recovered_usd.toFixed(2)}`;
+      return "✓ ALL CLAIMED";
+    }
+    return "COLLECT CLAIMS";
   }
 
   const wins = recentTrades.filter((t) => t.won).length;
@@ -380,10 +407,12 @@ export function TradeHistory() {
             "px-3 py-1 rounded text-xs font-bold border transition-all",
             collecting
               ? "text-purple-300 border-purple-400/30 bg-purple-400/5 cursor-wait"
+              : lastClaimsRecovery && lastClaimsRecovery.recovered_count > 0
+              ? "text-accent-green border-accent-green/40 bg-accent-green/10 hover:bg-accent-green/20"
               : "text-purple-400 border-purple-400/40 bg-purple-400/10 hover:bg-purple-400/20"
           )}
         >
-          {collecting ? "COLLECTING…" : "COLLECT CLAIMS"}
+          {claimButtonLabel()}
         </button>
       </div>
 

@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from agents.agent_base import BaseAgent, AgentVote, Vote
-from strategy.indicators import ema_crossover, ema_slope, macd_signal, macd_histogram
+from strategy.indicators import ema_crossover, ema_slope, macd_signal, macd_histogram, tick_direction_bias
 
 
 class MomentumAgent(BaseAgent):
@@ -71,6 +71,17 @@ class MomentumAgent(BaseAgent):
                 normalized = float(np.clip(macd_hist / 0.05, -1.0, 1.0))
                 signals.append(("macd_1m", normalized, 1.5))
                 reasons.append(f"MACD={'↑' if macd_hist > 0 else '↓'}")
+
+        # ── Tick direction bias fallback (works from 5 candles = 25 seconds) ──
+        # When candle history is too short for EMA/MACD, use raw tick direction
+        # as a lightweight early-window momentum signal.
+        if not signals and df_5s is not None and len(df_5s) >= 5:
+            bias = tick_direction_bias(df_5s, lookback=min(len(df_5s), 20))
+            if abs(bias) >= 0.4:
+                direction_score = bias * min(abs(window_delta_pct) / 0.05, 1.0)
+                if abs(direction_score) >= 0.15:
+                    signals.append(("tick_bias", bias, 1.0))
+                    reasons.append(f"tick_bias={'↑' if bias > 0 else '↓'}{abs(bias):.2f}")
 
         # ── Compute conviction ────────────────────────────────────────────────
         if not signals:

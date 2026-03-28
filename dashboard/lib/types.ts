@@ -1,6 +1,7 @@
 // ── WebSocket message types ───────────────────────────────────────────────────
 
 export type WsMessageType =
+  | "connection_init"
   | "tick"
   | "window_state"
   | "agent_votes"
@@ -10,6 +11,7 @@ export type WsMessageType =
   | "trade_cancelled"
   | "circuit_breaker"
   | "portfolio_update"
+  | "claims_recovery_complete"
   | "log"
   // ETH variants
   | "eth_tick"
@@ -35,6 +37,8 @@ export interface BtcTick {
 
 export type WindowPhase = "monitoring" | "evaluating" | "trading" | "deadline" | "resolved";
 
+export type MarketRegime = "TRENDING" | "VOLATILE" | "RANGING";
+
 export interface WindowState {
   window_ts: number;
   open_price: number;
@@ -44,6 +48,10 @@ export interface WindowState {
   elapsed_sec: number;
   remaining_sec: number;
   window_slug: string;
+  // Optional enrichments pushed from aggregator/strategy
+  oracle_latency_sec?: number;
+  market_regime?: MarketRegime | null;
+  regime_trend_strength?: number | null;
 }
 
 // ── Agent system ──────────────────────────────────────────────────────────────
@@ -81,6 +89,9 @@ export interface ConfidenceBreakdown {
   delta_contribution: number;
   regime_contribution: number;
   momentum_contribution: number;
+  time_decay_contribution: number;
+  persistence_contribution: number;
+  cross_asset_contribution: number;
   total: number;
   should_trade: boolean;
 }
@@ -177,6 +188,13 @@ export interface ActivePosition extends TradeExecuted {
 
 // ── Bot state (aggregated) ────────────────────────────────────────────────────
 
+export interface ClaimsRecoveryResult {
+  recovered_count: number;
+  recovered_usd: number;
+  pending_count: number;
+  total_checked: number;
+}
+
 export interface BotState {
   connected: boolean;
   // BTC
@@ -199,6 +217,7 @@ export interface BotState {
   portfolio: PortfolioUpdate | null;
   circuit: CircuitBreakerStatus | null;
   logs: LogEntry[];
+  lastClaimsRecovery: ClaimsRecoveryResult | null;
 }
 
 // ── Agent metadata ────────────────────────────────────────────────────────────

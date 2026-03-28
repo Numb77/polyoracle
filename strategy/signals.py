@@ -137,7 +137,8 @@ class SignalCombiner:
         """
         components = []
 
-        # ── 1. Window Delta (weight 7) ────────────────────────────────────────
+        # ── 1. Window Delta (weight 10) ───────────────────────────────────────
+        # Always present — this is THE anchor signal.
         window_score = self._score_window_delta(window_delta_pct)
         components.append(SignalComponent(
             name="window_delta",
@@ -147,68 +148,71 @@ class SignalCombiner:
         ))
 
         # ── 2. EMA Slope (weight 3) ───────────────────────────────────────────
-        ema_score = 0.0
+        # Only added when sufficient candle data exists.
+        # If absent, it does NOT dilute the composite denominator.
         if len(df_1m) >= 10:
             slope = ema_slope(df_1m, period=8, lookback=3)
-            # Normalize: slope of ±0.02% per candle → ±1.0
             ema_score = float(max(-1.0, min(1.0, slope / 0.02)))
-        components.append(SignalComponent(
-            name="ema_slope",
-            score=ema_score,
-            weight=self._weights["ema_slope"],
-        ))
+            components.append(SignalComponent(
+                name="ema_slope",
+                score=ema_score,
+                weight=self._weights["ema_slope"],
+            ))
 
         # ── 3. RSI (weight 2) ─────────────────────────────────────────────────
-        rsi_score = rsi_signal(df_1m) if len(df_1m) >= 15 else 0.0
-        components.append(SignalComponent(
-            name="rsi",
-            score=rsi_score,
-            weight=self._weights["rsi"],
-        ))
+        if len(df_1m) >= 15:
+            components.append(SignalComponent(
+                name="rsi",
+                score=rsi_signal(df_1m),
+                weight=self._weights["rsi"],
+            ))
 
         # ── 4. MACD (weight 2) ────────────────────────────────────────────────
-        macd_score = macd_signal(df_1m) if len(df_1m) >= 35 else 0.0
-        components.append(SignalComponent(
-            name="macd",
-            score=macd_score,
-            weight=self._weights["macd"],
-        ))
+        if len(df_1m) >= 35:
+            components.append(SignalComponent(
+                name="macd",
+                score=macd_signal(df_1m),
+                weight=self._weights["macd"],
+            ))
 
         # ── 5. Bollinger Bands (weight 1) ─────────────────────────────────────
-        # Bollinger gives mean-reversion signal — invert for direction
-        bb_pos = bollinger_position(df_1m) if len(df_1m) >= 20 else 0.0
-        # If price is at upper band (+1.0), expect DOWN → negate
-        bb_score = -bb_pos
-        components.append(SignalComponent(
-            name="bollinger",
-            score=bb_score,
-            weight=self._weights["bollinger"],
-        ))
+        # Inverted: price at upper band → expect DOWN
+        if len(df_1m) >= 20:
+            bb_score = -bollinger_position(df_1m)
+            components.append(SignalComponent(
+                name="bollinger",
+                score=bb_score,
+                weight=self._weights["bollinger"],
+            ))
 
-        # ── 6. Order Book Imbalance (weight 3) ───────────────────────────────
-        ob_score = float(max(-1.0, min(1.0, order_book_imbalance))) if order_book_imbalance is not None else 0.0
-        components.append(SignalComponent(
-            name="order_book",
-            score=ob_score,
-            weight=self._weights["order_book"],
-            description=f"Book imbalance: {order_book_imbalance:+.3f}" if order_book_imbalance is not None else "Book imbalance: no data",
-        ))
+        # ── 6. Order Book Imbalance (weight 4) ────────────────────────────────
+        # Always included when data is present; 0-score when balanced is valid
+        # information ("book says nothing") so it stays in the denominator.
+        if order_book_imbalance is not None:
+            ob_score = float(max(-1.0, min(1.0, order_book_imbalance)))
+            components.append(SignalComponent(
+                name="order_book",
+                score=ob_score,
+                weight=self._weights["order_book"],
+                description=f"Book imbalance: {order_book_imbalance:+.3f}",
+            ))
 
         # ── 7. Oracle Delta (weight 2) ────────────────────────────────────────
-        # If Binance shows BTC UP vs oracle, bet UP
-        oracle_score = float(max(-1.0, min(1.0, oracle_delta_pct / 0.05)))
-        components.append(SignalComponent(
-            name="oracle_delta",
-            score=oracle_score,
-            weight=self._weights["oracle_delta"],
-            description=f"CEX-Oracle delta: {oracle_delta_pct:+.4f}%",
-        ))
+        # Only include when divergence is meaningful (> noise floor).
+        if abs(oracle_delta_pct) >= 0.02:
+            oracle_score = float(max(-1.0, min(1.0, oracle_delta_pct / 0.05)))
+            components.append(SignalComponent(
+                name="oracle_delta",
+                score=oracle_score,
+                weight=self._weights["oracle_delta"],
+                description=f"CEX-Oracle delta: {oracle_delta_pct:+.4f}%",
+            ))
 
         return CompositeSignal(
             components=components,
             window_delta_score=window_score,
-            order_book_score=ob_score,
-            oracle_delta_score=oracle_score,
+            order_book_score=ob_score if order_book_imbalance is not None else 0.0,
+            oracle_delta_score=oracle_score if abs(oracle_delta_pct) >= 0.02 else 0.0,
         )
 
     def _score_window_delta(self, delta_pct: float) -> float:

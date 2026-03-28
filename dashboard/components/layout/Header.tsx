@@ -6,10 +6,12 @@ import { formatBtcPrice, getCircuitColor, cn } from "@/lib/utils";
 
 export function Header() {
   const { state } = useBotContext();
-  const { connected, lastTick, circuit, window: win, portfolio } = state;
+  const { connected, lastTick, ethLastTick, circuit, window: win, ethWindow, portfolio } = state;
   const [clock, setClock] = useState("");
-  const [flashClass, setFlashClass] = useState("");
-  const prevPrice = useRef<number | null>(null);
+  const [btcFlash, setBtcFlash] = useState("");
+  const [ethFlash, setEthFlash] = useState("");
+  const prevBtcPrice = useRef<number | null>(null);
+  const prevEthPrice = useRef<number | null>(null);
 
   useEffect(() => {
     const fmt = () =>
@@ -19,17 +21,29 @@ export function Header() {
     return () => clearInterval(id);
   }, []);
 
-  // Flash price on direction change
+  // Flash BTC price on change
   useEffect(() => {
     if (!lastTick) return;
-    if (prevPrice.current !== null && prevPrice.current !== lastTick.price) {
-      const dir = lastTick.price > prevPrice.current ? "flash-green" : "flash-red";
-      setFlashClass(dir);
-      const t = setTimeout(() => setFlashClass(""), 500);
+    if (prevBtcPrice.current !== null && prevBtcPrice.current !== lastTick.price) {
+      const dir = lastTick.price > prevBtcPrice.current ? "flash-green" : "flash-red";
+      setBtcFlash(dir);
+      const t = setTimeout(() => setBtcFlash(""), 500);
       return () => clearTimeout(t);
     }
-    prevPrice.current = lastTick.price;
+    prevBtcPrice.current = lastTick.price;
   }, [lastTick?.price]);
+
+  // Flash ETH price on change
+  useEffect(() => {
+    if (!ethLastTick) return;
+    if (prevEthPrice.current !== null && prevEthPrice.current !== ethLastTick.price) {
+      const dir = ethLastTick.price > prevEthPrice.current ? "flash-green" : "flash-red";
+      setEthFlash(dir);
+      const t = setTimeout(() => setEthFlash(""), 500);
+      return () => clearTimeout(t);
+    }
+    prevEthPrice.current = ethLastTick.price;
+  }, [ethLastTick?.price]);
 
   const remaining = win?.remaining_sec ?? 0;
   const progress = win ? ((300 - remaining) / 300) * 100 : 0;
@@ -58,19 +72,20 @@ export function Header() {
       )}
 
       {/* Logo */}
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-3 shrink-0">
         <div className="text-lg font-bold tracking-widest text-accent-green glow-text-green">
           POLY<span className="text-white">ORACLE</span>
         </div>
         <div className="text-xs text-text-secondary font-mono">v0.1.0</div>
       </div>
 
-      {/* Center: BTC Price + window */}
-      <div className="flex items-center gap-6 font-mono">
+      {/* Center: BTC + ETH prices + window countdown */}
+      <div className="flex items-center gap-5 font-mono">
+        {/* BTC */}
         {lastTick && (
           <div className="flex items-center gap-2">
-            <span className="text-xs text-text-secondary">BTC</span>
-            <span className={cn("text-xl font-semibold price-display", flashClass)}>
+            <span className="text-xs font-bold text-accent-green">BTC</span>
+            <span className={cn("text-lg font-semibold price-display", btcFlash)}>
               {formatBtcPrice(lastTick.price)}
             </span>
             {win && (
@@ -86,9 +101,37 @@ export function Header() {
           </div>
         )}
 
-        {/* Window countdown */}
+        {/* Divider */}
+        {lastTick && ethLastTick && (
+          <div className="w-px h-5 bg-zinc-700" />
+        )}
+
+        {/* ETH */}
+        {ethLastTick && (
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-bold text-indigo-400">ETH</span>
+            <span className={cn("text-lg font-semibold price-display", ethFlash)}>
+              {ethLastTick.price.toLocaleString("en-US", {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2,
+              })}
+            </span>
+            {ethWindow && (
+              <span
+                className={`text-xs font-mono ${
+                  ethWindow.delta_pct >= 0 ? "text-accent-green" : "text-accent-red"
+                }`}
+              >
+                {ethWindow.delta_pct >= 0 ? "+" : ""}
+                {ethWindow.delta_pct.toFixed(3)}%
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Window countdown (BTC) */}
         {win && (
-          <div className="flex items-center gap-2 text-xs">
+          <div className="flex items-center gap-2 text-xs border-l border-zinc-700 pl-4 ml-1">
             <span className="text-text-secondary uppercase">{win.phase}</span>
             <span
               className={cn(

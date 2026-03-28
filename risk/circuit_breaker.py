@@ -142,9 +142,9 @@ class CircuitBreaker:
         yellow_triggered = False
         yellow_reason = ""
 
-        if daily_loss_usd >= cfg.max_daily_loss_usd * 0.5:
+        if daily_loss_usd >= cfg.max_daily_loss_usd * 0.75:
             yellow_triggered = True
-            yellow_reason = f"Daily loss ${daily_loss_usd:.2f} > 50% of limit"
+            yellow_reason = f"Daily loss ${daily_loss_usd:.2f} > 75% of limit"
 
         if drawdown_pct >= cfg.max_drawdown_pct * 0.67:
             yellow_triggered = True

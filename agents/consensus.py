@@ -152,8 +152,14 @@ class ConsensusEngine:
         # Strength: normalized dominance
         strength = dominant_weight / total_weight
 
-        # Agreement ratio: fraction of active agents that agree
-        agreement_ratio = len(agreeing) / len(active_votes) if active_votes else 0.0
+        # Agreement ratio: fraction of non-muted agents that agree.
+        # Denominator = number of active (non-muted) agents, floored at 3
+        # so a solo oracle in a 5-agent pool can't score > 1/3 = 0.33.
+        # When agents are muted (e.g. 2 muted → 3 active), 2-of-3 agreeing
+        # correctly scores 0.67, not the artificially low 2/5 = 0.40.
+        active_agent_count = sum(1 for v in votes if not v.is_muted)
+        effective_denominator = max(active_agent_count, 3)
+        agreement_ratio = len(agreeing) / effective_denominator if effective_denominator > 0 else 0.0
 
         logger.debug(
             f"Consensus: {direction} strength={strength:.2f}, "

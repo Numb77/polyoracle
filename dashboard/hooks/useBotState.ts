@@ -10,6 +10,7 @@ import type {
   TradeExecuted,
   ActivePosition,
   BtcTick,
+  ClaimsRecoveryResult,
 } from "@/lib/types";
 
 let logIdCounter = 0;
@@ -33,6 +34,7 @@ const initialState: BotState = {
   portfolio: null,
   circuit: null,
   logs: [],
+  lastClaimsRecovery: null,
 };
 
 type Action =
@@ -48,6 +50,11 @@ function botReducer(state: BotState, action: Action): BotState {
       const { type, data } = action.payload;
 
       switch (type) {
+        case "connection_init":
+          // Server sends this before replaying log buffer + trade history.
+          // Clear both so the replay lands on clean state (no duplicates on reconnect).
+          return { ...state, logs: [], recentTrades: [] };
+
         case "tick": {
           const tick = data as BtcTick;
           return {
@@ -108,10 +115,10 @@ function botReducer(state: BotState, action: Action): BotState {
             activePositions: state.activePositions.filter(
               (p) => p.order_id !== resolved.order_id
             ),
-            recentTrades: [enriched, ...state.recentTrades].slice(
-              0,
-              MAX_TRADE_HISTORY
-            ),
+            recentTrades: [
+              enriched,
+              ...state.recentTrades.filter((t) => t.order_id !== resolved.order_id),
+            ].slice(0, MAX_TRADE_HISTORY),
           };
         }
 
@@ -188,10 +195,10 @@ function botReducer(state: BotState, action: Action): BotState {
             ethActivePositions: state.ethActivePositions.filter(
               (p) => p.order_id !== resolved.order_id
             ),
-            recentTrades: [enrichedEth, ...state.recentTrades].slice(
-              0,
-              MAX_TRADE_HISTORY
-            ),
+            recentTrades: [
+              enrichedEth,
+              ...state.recentTrades.filter((t) => t.order_id !== resolved.order_id),
+            ].slice(0, MAX_TRADE_HISTORY),
           };
         }
 
@@ -218,6 +225,12 @@ function botReducer(state: BotState, action: Action): BotState {
           return {
             ...state,
             circuit: data as BotState["circuit"],
+          };
+
+        case "claims_recovery_complete":
+          return {
+            ...state,
+            lastClaimsRecovery: data as ClaimsRecoveryResult,
           };
 
         case "log": {

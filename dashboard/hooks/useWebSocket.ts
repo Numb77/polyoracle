@@ -13,6 +13,11 @@ export function useWebSocket(onMessage: MessageHandler) {
   const reconnectDelay = useRef(1000);
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
+  // Tracks whether the hook is still mounted — prevents the onclose handler from
+  // scheduling a reconnect after React StrictMode unmounts and remounts the component,
+  // which would otherwise create two simultaneous WebSocket connections and duplicate
+  // every message in the reducer.
+  const mountedRef = useRef(false);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -38,7 +43,10 @@ export function useWebSocket(onMessage: MessageHandler) {
       ws.onclose = () => {
         setConnected(false);
         wsRef.current = null;
-        // Exponential backoff reconnect
+        // Only schedule a reconnect if the hook is still mounted.
+        // After cleanup (StrictMode unmount or real unmount), mountedRef.current
+        // is false and we stop the reconnect cycle.
+        if (!mountedRef.current) return;
         reconnectTimer.current = setTimeout(() => {
           reconnectDelay.current = Math.min(reconnectDelay.current * 2, 30000);
           connect();
@@ -49,13 +57,16 @@ export function useWebSocket(onMessage: MessageHandler) {
         ws.close();
       };
     } catch {
+      if (!mountedRef.current) return;
       reconnectTimer.current = setTimeout(connect, reconnectDelay.current);
     }
   }, []);
 
   useEffect(() => {
+    mountedRef.current = true;
     connect();
     return () => {
+      mountedRef.current = false;
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
     };

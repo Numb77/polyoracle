@@ -16,8 +16,10 @@ class OracleAgent(BaseAgent):
     """Exploits CEX-oracle price divergence for structural edge."""
 
     # Oracle delta thresholds (as % divergence)
-    SIGNIFICANT_DELTA = 0.03    # 0.03% divergence = meaningful
-    STRONG_DELTA = 0.08         # 0.08% divergence = strong signal
+    # Raised from 0.03 → 0.05: Chainlink updates every ~5 min so small gaps
+    # are common noise; only act on clearly meaningful divergence.
+    SIGNIFICANT_DELTA = 0.05    # 0.05% divergence = meaningful
+    STRONG_DELTA = 0.10         # 0.10% divergence = strong signal (was 0.08)
 
     # Maximum oracle staleness to trust
     MAX_ORACLE_LATENCY = 90.0   # seconds — beyond this, oracle signal unreliable
@@ -93,12 +95,23 @@ class OracleAgent(BaseAgent):
         else:
             alignment = ""
 
+        # Freshness bonus: oracle that hasn't updated in 2+ minutes has had more
+        # time to accumulate divergence — the edge is more reliable, not less,
+        # because it means the gap is persistent (not a transient noise spike).
+        # But if oracle is very stale (>60s), that's already handled above.
+        staleness_bonus = ""
+        if 45 <= oracle_latency_sec <= self.MAX_ORACLE_LATENCY:
+            # Scale: 45s stale → 5% boost, 90s stale → 15% boost
+            stale_factor = (oracle_latency_sec - 45) / 45.0
+            conviction = min(conviction * (1.0 + stale_factor * 0.15), 1.0)
+            staleness_bonus = f", stale={oracle_latency_sec:.0f}s"
+
         return AgentVote(
             agent_name=self.name,
             vote=vote,
             conviction=min(conviction, 1.0),
             reasoning=(
                 f"{note.title()} oracle edge {vote.value}: "
-                f"CEX-oracle={oracle_delta_pct:+.4f}%{alignment}"
+                f"CEX-oracle={oracle_delta_pct:+.4f}%{alignment}{staleness_bonus}"
             ),
         )
