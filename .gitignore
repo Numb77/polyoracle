@@ -25,8 +25,9 @@ htmlcov/
 .coverage
 *.cover
 
-# Logs
-logs/
+# Logs — keep the directory itself, ignore its contents
+logs/*
+!logs/.gitkeep
 *.log
 
 # Node / Next.js
@@ -36,6 +37,8 @@ out/
 dashboard/.next/
 dashboard/node_modules/
 dashboard/out/
+tsconfig.tsbuildinfo
+dashboard/tsconfig.tsbuildinfo
 
 # Data
 data/cache/
