@@ -56,10 +56,12 @@ class TokenResolver:
         gamma_client: GammaClient,
         rest_client: PolymarketRestClient,
         asset: str = "btc",
+        clob_keywords: list[str] | None = None,
     ) -> None:
         self._gamma = gamma_client
         self._rest = rest_client
         self._asset = asset.lower()
+        self._clob_keywords = clob_keywords
         self._cache: dict[int, tuple[ResolvedMarket, float]] = {}
 
     async def resolve_current(self) -> ResolvedMarket | None:
@@ -116,7 +118,7 @@ class TokenResolver:
 
     async def _resolve_via_clob_search(self, window_ts: int) -> ResolvedMarket | None:
         """Fallback: search CLOB API for active asset markets."""
-        asset_keywords = {
+        asset_keywords = self._clob_keywords or {
             "btc": ["btc", "bitcoin"],
             "eth": ["eth", "ethereum"],
         }.get(self._asset, [self._asset])

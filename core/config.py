@@ -5,13 +5,16 @@ This is the single source of truth for all configuration values.
 
 from __future__ import annotations
 
+import json as _json
 import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from core.asset_config import AssetConfig, DEFAULT_ASSETS
 
 
 class Config(BaseSettings):
@@ -53,6 +56,31 @@ class Config(BaseSettings):
     binance_rest_url: str = "https://api.binance.com"
     chainlink_btc_usd_proxy: str = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
     chainlink_eth_usd_proxy: str = "0xF9680D99D6C9589e2a93a78A04A279e509205945"
+
+    # ── Multi-asset registry ──────────────────────────────────────────────────
+    # Optional JSON override: list of AssetConfig dicts.
+    # If unset, DEFAULT_ASSETS (BTC + ETH + SOL + DOGE + XRP) is used.
+    # Example: ASSETS_JSON=[{"symbol":"BTC","enabled":true},{"symbol":"ETH","enabled":true}]
+    assets_json: str = ""
+
+    @property
+    def assets(self) -> list[AssetConfig]:
+        """Return the list of enabled asset configs."""
+        if self.assets_json:
+            raw = _json.loads(self.assets_json)
+            # Merge partial overrides onto defaults keyed by symbol
+            defaults_by_sym = {a.symbol: a for a in DEFAULT_ASSETS}
+            result = []
+            for entry in raw:
+                sym = entry.get("symbol", "")
+                base = defaults_by_sym.get(sym)
+                if base:
+                    merged = base.model_copy(update=entry)
+                else:
+                    merged = AssetConfig(**entry)
+                result.append(merged)
+            return [a for a in result if a.enabled]
+        return [a for a in DEFAULT_ASSETS if a.enabled]
 
     # ── Strategy parameters ───────────────────────────────────────────────────
     trade_amount_usd: float = Field(default=100.0, ge=1.0, le=1000.0)
@@ -97,7 +125,7 @@ class Config(BaseSettings):
 
     # ── Paper trading ─────────────────────────────────────────────────────────
     paper_mode: bool = True
-    paper_initial_balance: float = Field(default=1000.0, ge=100.0)
+    paper_initial_balance: float = Field(default=1000.0, ge=5.0)
 
     # ── Dashboard / WebSocket ─────────────────────────────────────────────────
     ws_server_port: int = Field(default=8765, ge=1024, le=65535)
