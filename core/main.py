@@ -734,7 +734,7 @@ class PolyOracle:
         if agg.binance_price <= 0:
             logger.warning(f"{symbol} price unavailable (Binance feed down?) — skip trade")
             return
-        if agg.oracle_latency_sec > 300:
+        if agg.oracle_latency_sec > 300 and lane.config.chainlink_proxy:
             logger.warning(
                 f"{symbol} Chainlink oracle stale: {agg.oracle_latency_sec:.0f}s since last update"
             )

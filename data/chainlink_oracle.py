@@ -98,7 +98,9 @@ class ChainlinkOracle:
             u for u in self.FALLBACK_RPC_URLS if u != cfg.polygon_rpc_url
         ]
         self._rpc_index = 0
-        self._proxy_address = proxy_address or cfg.chainlink_btc_usd_proxy
+        # Use explicit proxy if provided (even empty string); only fall back to
+        # the default BTC proxy when caller passes None.
+        self._proxy_address = proxy_address if proxy_address is not None else cfg.chainlink_btc_usd_proxy
         self._w3: AsyncWeb3 | None = None
         self._contract = None
         self._decimals: int = 8   # Chainlink BTC/USD uses 8 decimal places
@@ -109,8 +111,21 @@ class ChainlinkOracle:
     def _rpc_url(self) -> str:
         return self._rpc_urls[self._rpc_index % len(self._rpc_urls)]
 
-    def _next_rpc(self) -> None:
-        """Rotate to the next RPC endpoint."""
+    async def _close_current_session(self) -> None:
+        """Close any open aiohttp sessions held by the current web3 instance."""
+        if self._w3 is None:
+            return
+        try:
+            cache = self._w3.provider._request_session_manager.session_cache
+            for session in list(cache._data.values()):
+                if hasattr(session, "close") and not session.closed:
+                    await session.close()
+        except Exception:
+            pass
+
+    async def _next_rpc(self) -> None:
+        """Rotate to the next RPC endpoint, closing the current session first."""
+        await self._close_current_session()
         self._rpc_index += 1
         self._w3 = None
         self._contract = None
@@ -166,23 +181,29 @@ class ChainlinkOracle:
             )
             if any(t in err_str for t in rotate_triggers):
                 logger.warning(f"Chainlink RPC unavailable ({self._rpc_url}): {exc} — rotating endpoint")
-                self._next_rpc()
+                await self._next_rpc()
             else:
                 logger.warning(f"Failed to read Chainlink oracle: {exc}")
             return None
 
     async def start(self) -> None:
         """Start polling the oracle in the background."""
+        if not self._proxy_address:
+            return  # No Chainlink feed configured for this asset — skip polling.
+
         self._running = True
         await self._init_web3()
         logger.info("ChainlinkOracle polling started")
 
-        while self._running:
-            try:
-                await self.fetch_latest()
-            except Exception as exc:
-                logger.warning(f"Oracle poll error: {exc}")
-            await asyncio.sleep(self.POLL_INTERVAL)
+        try:
+            while self._running:
+                try:
+                    await self.fetch_latest()
+                except Exception as exc:
+                    logger.warning(f"Oracle poll error: {exc}")
+                await asyncio.sleep(self.POLL_INTERVAL)
+        finally:
+            await self._close_current_session()
 
     def stop(self) -> None:
         self._running = False
