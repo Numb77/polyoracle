@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useBotContext } from "@/app/providers";
 import { getVoteColor, getVoteDot, cn } from "@/lib/utils";
 import { AGENT_META, type AgentVote } from "@/lib/types";
@@ -197,7 +198,13 @@ function ConsensusGauge({
 
 export function AgentPanel() {
   const { state, send } = useBotContext();
-  const { agents } = state;
+  const assetSymbols = Object.keys(state.assets);
+  const [selectedAsset, setSelectedAsset] = useState<string>("BTC");
+
+  const activeAsset = assetSymbols.includes(selectedAsset)
+    ? selectedAsset
+    : assetSymbols[0] ?? "BTC";
+  const agents = state.assets[activeAsset]?.agents ?? null;
 
   const handleUnmute = (agentName: string) => {
     send({ command: "unmute_agent", agent: agentName });
@@ -207,27 +214,47 @@ export function AgentPanel() {
     send({ command: "mute_agent", agent: agentName });
   };
 
-  if (!agents) {
-    return (
-      <div className="text-center text-text-secondary py-12">
-        No agent data yet. Waiting for evaluation window...
-      </div>
-    );
-  }
-
   return (
-    <div>
-      <ConsensusGauge
-        direction={agents.direction}
-        strength={agents.strength}
-        upWeight={agents.up_weight}
-        downWeight={agents.down_weight}
-      />
-<div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-        {agents.votes.map((vote) => (
-          <AgentCard key={vote.agent} vote={vote} onUnmute={handleUnmute} onMute={handleMute} />
-        ))}
-      </div>
+    <div className="space-y-4">
+      {/* Asset selector */}
+      {assetSymbols.length > 1 && (
+        <div className="flex gap-2">
+          {assetSymbols.map((sym) => (
+            <button
+              key={sym}
+              onClick={() => setSelectedAsset(sym)}
+              className={cn(
+                "px-3 py-1 rounded text-xs font-bold font-mono border transition-colors",
+                activeAsset === sym
+                  ? "border-accent-green text-accent-green bg-accent-green/10"
+                  : "border-zinc-700 text-text-secondary hover:text-white hover:border-zinc-500"
+              )}
+            >
+              {sym}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {!agents ? (
+        <div className="text-center text-text-secondary py-12">
+          No agent data yet for {activeAsset}. Waiting for evaluation window...
+        </div>
+      ) : (
+        <div>
+          <ConsensusGauge
+            direction={agents.direction}
+            strength={agents.strength}
+            upWeight={agents.up_weight}
+            downWeight={agents.down_weight}
+          />
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+            {agents.votes.map((vote) => (
+              <AgentCard key={vote.agent} vote={vote} onUnmute={handleUnmute} onMute={handleMute} />
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

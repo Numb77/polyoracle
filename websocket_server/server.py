@@ -62,9 +62,14 @@ class DashboardServer:
         try:
             self._queue.put_nowait(msg)
             # Cache latest state per type for new clients
-            self._last_state[msg_type] = msg
+            # Cache per (type, asset) so each asset's latest state is preserved
+            if isinstance(data, dict) and "asset" in data:
+                cache_key = f"{msg_type}:{data['asset']}"
+            else:
+                cache_key = msg_type
+            self._last_state[cache_key] = msg
             # Track trade history for catch-up on new connect
-            if msg_type in ("trade_resolved", "eth_trade_resolved"):
+            if msg_type == "trade_resolved":
                 self._trade_history.append(msg)
                 if len(self._trade_history) > 500:
                     self._trade_history = self._trade_history[-500:]

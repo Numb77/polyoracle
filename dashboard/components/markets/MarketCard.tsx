@@ -13,7 +13,7 @@ import {
   cn,
 } from "@/lib/utils";
 import { AGENT_META } from "@/lib/types";
-import type { BtcTick, WindowState, Consensus, ConfidenceBreakdown, MarketRegime, TradeResolved } from "@/lib/types";
+import type { PriceTick, WindowState, Consensus, ConfidenceBreakdown, MarketRegime, TradeResolved } from "@/lib/types";
 
 // ── Confidence breakdown stacked bar ─────────────────────────────────────────
 
@@ -66,7 +66,7 @@ function ConfidenceBreakdownBar({ conf }: { conf: ConfidenceBreakdown }) {
 
 // ── BTC/ETH price sparkline ───────────────────────────────────────────────────
 
-function Sparkline({ ticks }: { ticks: BtcTick[] }) {
+function Sparkline({ ticks }: { ticks: PriceTick[] }) {
   if (ticks.length < 2) return <div className="h-10 w-full" />;
 
   const W = 260;
@@ -200,8 +200,8 @@ function ConfidenceGauge({ score, shouldTrade }: { score: number; shouldTrade: b
 
 // ── Per-asset session stats ────────────────────────────────────────────────────
 
-function AssetSessionStats({ trades, asset }: { trades: TradeResolved[]; asset: "BTC" | "ETH" }) {
-  const assetTrades = trades.filter((t) => (t.asset ?? (t.market.startsWith("eth") ? "ETH" : "BTC")) === asset);
+function AssetSessionStats({ trades, asset }: { trades: TradeResolved[]; asset: string }) {
+  const assetTrades = trades.filter((t) => (t.asset ?? t.market.split("-")[0].toUpperCase()) === asset);
   if (assetTrades.length === 0) return null;
   const wins = assetTrades.filter((t) => t.won).length;
   const losses = assetTrades.length - wins;
@@ -222,23 +222,40 @@ function AssetSessionStats({ trades, asset }: { trades: TradeResolved[]; asset: 
   );
 }
 
+const ASSET_LABEL: Record<string, string> = {
+  BTC: "Bitcoin",
+  ETH: "Ethereum",
+  SOL: "Solana",
+  DOGE: "Dogecoin",
+  XRP: "XRP",
+};
+
+const ASSET_COLOR: Record<string, string> = {
+  BTC: "text-accent-green",
+  ETH: "text-indigo-400",
+  SOL: "text-purple-400",
+  DOGE: "text-yellow-400",
+  XRP: "text-sky-400",
+};
+
 // ── Main MarketCard ───────────────────────────────────────────────────────────
 
 interface MarketCardProps {
-  asset?: "BTC" | "ETH";
+  asset: string;
 }
 
-export function MarketCard({ asset = "BTC" }: MarketCardProps) {
+export function MarketCard({ asset }: MarketCardProps) {
   const { state } = useBotContext();
 
-  const win: WindowState | null = asset === "ETH" ? state.ethWindow : state.window;
-  const ticks: BtcTick[] = asset === "ETH" ? state.ethTicks : state.ticks;
-  const confidence: ConfidenceBreakdown | null = asset === "ETH" ? state.ethConfidence : state.confidence;
-  const agents: Consensus | null = asset === "ETH" ? state.ethAgents : state.agents;
+  const assetState = state.assets[asset];
+  const win: WindowState | null = assetState?.window ?? null;
+  const ticks: PriceTick[] = assetState?.ticks ?? [];
+  const confidence: ConfidenceBreakdown | null = assetState?.confidence ?? null;
+  const agents: Consensus | null = assetState?.agents ?? null;
   const { recentTrades } = state;
 
-  const assetLabel = asset === "ETH" ? "Ethereum" : "Bitcoin";
-  const assetColor = asset === "ETH" ? "text-indigo-400" : "text-accent-green";
+  const assetLabel = ASSET_LABEL[asset] ?? asset;
+  const assetColor = ASSET_COLOR[asset] ?? "text-zinc-400";
 
   if (!win) {
     return (

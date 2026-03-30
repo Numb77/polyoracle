@@ -74,8 +74,11 @@ export default function Home() {
 
         {activeTab === "markets" && (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <MarketCard asset="BTC" />
-            <MarketCard asset="ETH" />
+            {Object.keys(state.assets).length > 0
+              ? Object.keys(state.assets).map((sym) => (
+                  <MarketCard key={sym} asset={sym} />
+                ))
+              : ["BTC", "ETH"].map((sym) => <MarketCard key={sym} asset={sym} />)}
           </div>
         )}
 
