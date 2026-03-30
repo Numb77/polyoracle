@@ -76,7 +76,7 @@ export function Header() {
         <div className="text-lg font-bold tracking-widest text-accent-green glow-text-green">
           POLY<span className="text-white">ORACLE</span>
         </div>
-        <div className="text-xs text-text-secondary font-mono">v0.1.0</div>
+        <div className="text-xs text-text-secondary font-mono">v1.0.0</div>
       </div>
 
       {/* Center: BTC + ETH prices + window countdown */}

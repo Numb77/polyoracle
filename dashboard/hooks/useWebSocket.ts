@@ -41,11 +41,14 @@ export function useWebSocket(onMessage: MessageHandler) {
       };
 
       ws.onclose = () => {
+        // Guard: if a newer WS has already been created and stored in wsRef,
+        // this close event is from a stale connection — ignore it completely.
+        // Without this check, ws1.onclose (firing after ws2 is already open)
+        // would null wsRef, orphan ws2, and schedule a redundant reconnect,
+        // leaving two simultaneous connections that both receive every message.
+        if (wsRef.current !== ws) return;
         setConnected(false);
         wsRef.current = null;
-        // Only schedule a reconnect if the hook is still mounted.
-        // After cleanup (StrictMode unmount or real unmount), mountedRef.current
-        // is false and we stop the reconnect cycle.
         if (!mountedRef.current) return;
         reconnectTimer.current = setTimeout(() => {
           reconnectDelay.current = Math.min(reconnectDelay.current * 2, 30000);

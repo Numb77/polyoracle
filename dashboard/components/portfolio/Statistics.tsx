@@ -86,7 +86,7 @@ export function Statistics() {
       />
       <StatCard
         label="EXPECTED VALUE"
-        value={`${(p.expected_value * 100).toFixed(2)}¢`}
+        value={`${p.expected_value >= 0 ? "+" : ""}$${Math.abs(p.expected_value).toFixed(2)}`}
         color={p.expected_value > 0 ? "text-accent-green" : "text-accent-red"}
         sub="Per trade"
       />

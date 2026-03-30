@@ -305,8 +305,8 @@ class PolymarketExecutor:
             if amount < 1.0:
                 break
             try:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, self._place_fok_sync, client, token_id, amount
+                result = await self._post_order_with_retry(
+                    self._place_fok_sync, client, token_id, amount
                 )
 
                 if result and result.get("orderID"):
@@ -354,17 +354,10 @@ class PolymarketExecutor:
                     "fully filled or killed", "fok", "400",
                 ))
                 is_timeout = "timeout" in exc_str or "readtimeout" in exc_str
-                is_tls_early = "425" in str(exc)
-
                 if is_no_liquidity:
                     # Empty order book — retrying won't help
                     logger.info("FOK skipped — no asks in order book (illiquid market)")
                     break
-                elif is_tls_early and attempt == 0:
-                    # HTTP 425: TLS 1.3 0-RTT early-data rejected — retry immediately
-                    logger.debug("FOK got HTTP 425 (TLS early-data) — retrying once")
-                    await asyncio.sleep(0.5)
-                    continue
                 elif is_depth and attempt == 0:
                     logger.info(
                         f"FOK insufficient depth at ${amount:.2f} — "
@@ -479,21 +472,40 @@ class PolymarketExecutor:
             )
             return None
 
-        # Fee check at bid price
+        # Fee check at bid price.
+        # Edge = fair_value - bid_price (how much cheaper we're buying vs our estimate).
         if not self._fees.has_live_rate:
             await self._refresh_fee_rate()
-        gtc_edge = max(0.0, confidence / 100.0 - bid_price)
-        fee_est = self._fees.estimate(
-            token_price=bid_price,
-            notional_usd=position_size_usd,
-            edge_pct=gtc_edge,
-        )
-        if not fee_est.is_worth_trading:
-            logger.info(
-                f"GTC not worth trading: fee={fee_est.fee_pct:.1%} ≥ edge={gtc_edge:.1%} "
-                f"(bid={bid_price:.3f}, conf={confidence:.0f}) — skip"
+        fair_value = confidence / 100.0
+        gtc_edge = max(0.0, fair_value - bid_price)
+
+        # Distinguish resting bids from aggressive (crossing) bids:
+        #   Resting  (bid < ask):  fills as MAKER → 0% fee on Polymarket.
+        #                          Any non-negative edge is profitable.
+        #   Aggressive (bid ≥ ask): fills as TAKER → ~3% fee.
+        #                          Must satisfy the normal fee check.
+        is_resting = best_ask is not None and bid_price < best_ask
+        if not is_resting:
+            # Aggressive (taker) bid — apply real fee check
+            fee_est = self._fees.estimate(
+                token_price=bid_price,
+                notional_usd=position_size_usd,
+                edge_pct=gtc_edge,
             )
-            return None
+            if not fee_est.is_worth_trading:
+                logger.info(
+                    f"GTC not worth trading: fee={fee_est.fee_pct:.1%} ≥ edge={gtc_edge:.1%} "
+                    f"(bid={bid_price:.3f}, conf={confidence:.0f}) — skip"
+                )
+                return None
+        else:
+            # Resting maker bid — fee is 0%, spread check already guards dead orders.
+            fee_est = self._fees.estimate(
+                token_price=bid_price,
+                notional_usd=position_size_usd,
+                fee_rate_bps=0,
+                edge_pct=gtc_edge,
+            )
 
         # Size in shares
         size_shares = position_size_usd / bid_price
@@ -604,41 +616,54 @@ class PolymarketExecutor:
             self._orders.mark_cancelled(order_id, "CLOB client unavailable")
             return None
 
-        for attempt in range(2):
-            try:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, self._place_gtc_sync, client, token_id, bid_price, size_shares
-                )
-                if result and result.get("orderID"):
-                    real_order_id = result["orderID"]
-                    # Update the order record with the exchange-assigned ID
-                    self._orders._active.pop(order_id, None)
-                    order.order_id = real_order_id
-                    self._orders._active[real_order_id] = order
+        try:
+            result = await self._post_order_with_retry(
+                self._place_gtc_sync, client, token_id, bid_price, size_shares
+            )
+            if result and result.get("orderID"):
+                real_order_id = result["orderID"]
+                # Update the order record with the exchange-assigned ID
+                self._orders._active.pop(order_id, None)
+                order.order_id = real_order_id
+                self._orders._active[real_order_id] = order
 
-                    logger.trade(  # type: ignore[attr-defined]
-                        f"[LIVE-GTC] {direction} {outcome} {market.slug[:20]}... "
-                        f"@ bid={bid_price:.3f} × {size_shares:.1f} shares = ${size_usd:.2f} "
-                        f"[{real_order_id[:12]}...] (resting — awaiting fill)"
-                    )
-                    return order
-                else:
-                    logger.warning(f"GTC order returned no orderID: {result}")
-                break
-            except Exception as exc:
-                exc_str = str(exc)
-                # HTTP 425 "Too Early" is a TLS 1.3 0-RTT early-data rejection —
-                # the server refuses the first request on a resumed session.
-                # Retry once immediately with a fresh connection; it always works.
-                if "425" in exc_str and attempt == 0:
-                    logger.debug("GTC order got HTTP 425 (TLS early-data) — retrying once")
-                    await asyncio.sleep(0.5)
-                    continue
-                logger.error(f"GTC order failed: {exc}", exc_info=True)
-                break
+                logger.trade(  # type: ignore[attr-defined]
+                    f"[LIVE-GTC] {direction} {outcome} {market.slug[:20]}... "
+                    f"@ bid={bid_price:.3f} × {size_shares:.1f} shares = ${size_usd:.2f} "
+                    f"[{real_order_id[:12]}...] (resting — awaiting fill)"
+                )
+                return order
+            else:
+                logger.warning(f"GTC order returned no orderID: {result}")
+        except Exception as exc:
+            logger.error(f"GTC order failed: {exc}", exc_info=True)
 
         self._orders.mark_cancelled(order_id, "GTC placement failed")
         return None
+
+    async def _post_order_with_retry(self, executor_fn, *args, max_425_retries: int = 4) -> dict:
+        """
+        Call a synchronous CLOB order function via run_in_executor, retrying on HTTP 425.
+
+        HTTP 425 ("Too Early" / "service not ready") is returned by Polymarket when
+        the CLOB backend is temporarily unavailable or rate-limiting the connection.
+        It is transient — retrying with exponential backoff (1 → 2 → 4 → 8s) reliably
+        succeeds once the server is ready.  Any other exception is re-raised immediately
+        so callers can handle it (no-liquidity, depth-insufficient, timeout, etc).
+        """
+        for attempt in range(max_425_retries + 1):
+            try:
+                return await asyncio.get_event_loop().run_in_executor(None, executor_fn, *args)
+            except Exception as exc:
+                if "425" in str(exc) and attempt < max_425_retries:
+                    delay = 1 << attempt  # 1, 2, 4, 8s
+                    logger.debug(
+                        f"CLOB returned HTTP 425 (service not ready) — "
+                        f"retry {attempt + 1}/{max_425_retries} in {delay}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise  # non-425 or retries exhausted
 
     def _place_gtc_sync(
         self, client, token_id: str, bid_price: float, size_shares: float
@@ -888,18 +913,15 @@ class PolymarketExecutor:
             confidence_cap = round(order.confidence / 100, 2)
 
             if new_ask > confidence_cap:
-                # Market has moved past our edge — cancel and don't re-enter.
-                # The deadline FOK pass will take over with fresh evaluation.
-                await asyncio.get_event_loop().run_in_executor(
-                    None, client.cancel, order.order_id
+                # Ask has risen past our confidence cap, but the existing bid
+                # (order.price) is still well below cap and has positive EV.
+                # Skip repricing — don't touch the bid. It may fill if the market
+                # pulls back. cancel_all_open() handles cleanup at window close.
+                logger.debug(
+                    f"GTC ask {new_ask:.3f} > cap {confidence_cap:.3f} "
+                    f"— skipping reprice, keeping bid at {order.price:.3f}"
                 )
-                self._orders.mark_cancelled(order.order_id, "Ask above confidence cap — no edge")
-                logger.info(
-                    f"GTC cancelled (no edge): {order.market_slug[:20]}... "
-                    f"ask={new_ask:.3f} > conf_cap={confidence_cap:.3f}"
-                )
-                cancelled_permanently = True
-                return True
+                return False
 
             if new_ask <= order.price:
                 return False  # Ask came back down or hasn't moved — order is still competitive

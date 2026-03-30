@@ -62,6 +62,28 @@ logger = get_logger(__name__)
 cfg = get_config()
 
 
+def _order_actual_cost(order) -> float:
+    """
+    Return the actual USDC at risk for an order.
+
+    For ACTIVE orders (still resting in the book) we don't know the final fill
+    amount yet, so we reserve the full intended size_usd.
+
+    For FILLED orders, the real cost is filled_shares × filled_price.
+    Using size_usd (the *intended* order size) for partial GTC fills inflates
+    exposure — e.g. a $200 GTC that only matched 10 shares at $0.65 ($6.50
+    actual cost) would count as $200, permanently blocking new trades.
+    """
+    from execution.order_manager import OrderStatus
+    if (
+        order.status == OrderStatus.FILLED
+        and order.filled_shares > 0
+        and (order.filled_price or order.price) > 0
+    ):
+        return round(order.filled_shares * (order.filled_price or order.price), 2)
+    return order.size_usd
+
+
 class PolyOracle:
     """
     Main bot orchestrator. Wires all components and runs the event loop.
@@ -292,6 +314,36 @@ class PolyOracle:
                 )
         except Exception as exc:
             logger.warning(f"PnL tracker DB warmup failed: {exc}")
+
+        # Seed dashboard trade history from DB so the Trade History tab is
+        # populated on first load, not just for trades from the current session.
+        # We reuse the already-loaded all_records (pnl_records) but need to
+        # do a separate query for the display fields (agent_votes, order_type, etc.).
+        try:
+            display_records = await trade_db.load_resolved_trades(asset=None, limit=500)
+            for r in reversed(display_records):  # oldest→newest so history is in order
+                if r.get("won") is None or r.get("pnl") is None:
+                    continue
+                asset = (r.get("asset") or "BTC").upper()
+                msg_type = "eth_trade_resolved" if asset == "ETH" else "trade_resolved"
+                self._dashboard.push(msg_type, {
+                    "order_id": r["order_id"],
+                    "market": r.get("market", ""),
+                    "asset": asset,
+                    "direction": r["direction"],
+                    "actual_direction": r["actual_direction"],
+                    "won": bool(r["won"]),
+                    "pnl": round(float(r["pnl"]), 2),
+                    "window_ts": r["window_ts"],
+                    "price": float(r.get("entry_price") or 0),
+                    "size_usd": float(r.get("size_usd") or 0),
+                    "confidence": float(r.get("confidence") or 0),
+                    "order_type": r.get("order_type"),
+                })
+            if display_records:
+                logger.info(f"Dashboard trade history seeded from DB: {len(display_records)} trades")
+        except Exception as exc:
+            logger.warning(f"Dashboard trade history DB seed failed: {exc}")
 
     async def _flush_startup_claims(self) -> None:
         """
@@ -687,27 +739,33 @@ class PolyOracle:
         )
 
         # Cancel any GTC orders that didn't fill before the window ended.
-        # Release exposure and refund reserved balance for each unfilled cancellation.
+        # Release exposure and refund the UNFILLED portion of reserved balance.
+        # For partial GTC fills: actual_cost is the filled portion (already spent),
+        # so refund = size_usd - actual_cost (the uncommitted remainder).
         cancelled_orders = await self._executor.cancel_all_open()
         for order in cancelled_orders:
-            self._exposure.close_position(order.size_usd)
-            self._balance += order.size_usd + order.fee_usd
+            actual = _order_actual_cost(order)
+            refund = order.size_usd - actual  # unfilled portion only
+            self._exposure.close_position(order.size_usd)  # full reservation released
+            self._balance += refund + order.fee_usd
             self._dashboard.push("trade_cancelled", {"order_id": order.order_id})
         if cancelled_orders:
             logger.info(
                 f"BTC: Cancelled {len(cancelled_orders)} unfilled GTC order(s) at window close "
-                f"(exposure released, ${sum(o.size_usd for o in cancelled_orders):.2f} refunded)"
+                f"(exposure released, ${sum(order.size_usd - _order_actual_cost(order) for order in cancelled_orders):.2f} refunded)"
             )
 
         eth_cancelled_orders = await self._eth_executor.cancel_all_open()
         for order in eth_cancelled_orders:
+            actual = _order_actual_cost(order)
+            refund = order.size_usd - actual
             self._exposure.close_position(order.size_usd)
-            self._balance += order.size_usd + order.fee_usd
+            self._balance += refund + order.fee_usd
             self._dashboard.push("eth_trade_cancelled", {"order_id": order.order_id})
         if eth_cancelled_orders:
             logger.info(
                 f"ETH: Cancelled {len(eth_cancelled_orders)} unfilled GTC order(s) at window close "
-                f"(exposure released, ${sum(o.size_usd for o in eth_cancelled_orders):.2f} refunded)"
+                f"(exposure released, ${sum(order.size_usd - _order_actual_cost(order) for order in eth_cancelled_orders):.2f} refunded)"
             )
 
         # Process claims after a short delay (let resolution finalize)
@@ -889,30 +947,36 @@ class PolyOracle:
             eth_votes_payload = eth_consensus.to_dict()["votes"] if eth_consensus else []
             eth_conf_payload = decision.confidence.to_dict()
 
-            self._dashboard.push("eth_trade_executed", {
-                "order_id": order.order_id,
-                "market": order.market_slug,
-                "asset": "ETH",
-                "direction": order.direction,
-                "price": order.price,
-                "size_usd": order.size_usd,
-                "confidence": order.confidence,
-                "window_ts": order.window_ts,
-                "order_type": order_type_tag,
-                "agent_votes": eth_votes_payload,
-                "confidence_breakdown": eth_conf_payload,
-                "window_delta_pct": round(
-                    (self._eth_aggregator.current_price - self._eth_strategy.window_open_price)
-                    / self._eth_strategy.window_open_price * 100
-                    if self._eth_strategy.window_open_price > 0 else 0.0,
-                    4
-                ),
-            })
+            is_live_gtc_eth = not order.is_paper and order_type_tag == "GTC"
+            # Live GTC orders are not yet filled — don't show in Active Positions
+            # until the fill poll confirms execution. Paper / FOK fire immediately.
+            if not is_live_gtc_eth:
+                self._dashboard.push("eth_trade_executed", {
+                    "order_id": order.order_id,
+                    "market": order.market_slug,
+                    "asset": "ETH",
+                    "direction": order.direction,
+                    "price": order.price,
+                    "size_usd": order.size_usd,
+                    "confidence": order.confidence,
+                    "window_ts": order.window_ts,
+                    "order_type": order_type_tag,
+                    "agent_votes": eth_votes_payload,
+                    "confidence_breakdown": eth_conf_payload,
+                    "window_delta_pct": round(
+                        (self._eth_aggregator.current_price - self._eth_strategy.window_open_price)
+                        / self._eth_strategy.window_open_price * 100
+                        if self._eth_strategy.window_open_price > 0 else 0.0,
+                        4
+                    ),
+                })
             self._dashboard.push_log(
-                "TRADE", "executor",
-                f"{'[PAPER] ' if order.is_paper else ''}ETH TRADE {order.direction} "
+                "INFO" if is_live_gtc_eth else "TRADE", "executor",
+                f"{'[PAPER] ' if order.is_paper else ''}ETH "
+                f"{'GTC PLACED' if is_live_gtc_eth else f'TRADE {order.direction}'} "
                 f"[{order_type_tag}] @ {order.price:.3f} × ${order.size_usd:.2f} "
                 f"(conf={order.confidence:.0f})"
+                + (" — awaiting fill" if is_live_gtc_eth else "")
             )
             asyncio.create_task(trade_db.record_trade(
                 order_id=order.order_id,
@@ -1082,25 +1146,32 @@ class PolyOracle:
             votes_payload = consensus.to_dict()["votes"] if consensus else []
             conf_payload = decision.confidence.to_dict()
 
-            self._dashboard.push("trade_executed", {
-                "order_id": order.order_id,
-                "market": order.market_slug,
-                "asset": "BTC",
-                "direction": order.direction,
-                "price": order.price,
-                "size_usd": order.size_usd,
-                "confidence": order.confidence,
-                "window_ts": order.window_ts,
-                "order_type": order_type_tag,
-                "agent_votes": votes_payload,
-                "confidence_breakdown": conf_payload,
-                "window_delta_pct": round(window.delta_pct, 4),
-            })
+            # Live GTC orders rest in the book — not yet filled.
+            # Don't show in Active Positions until fill poll confirms execution.
+            # Paper / FOK orders are immediately executed so they show right away.
+            is_live_gtc = not order.is_paper and order_type_tag == "GTC"
+            if not is_live_gtc:
+                self._dashboard.push("trade_executed", {
+                    "order_id": order.order_id,
+                    "market": order.market_slug,
+                    "asset": "BTC",
+                    "direction": order.direction,
+                    "price": order.price,
+                    "size_usd": order.size_usd,
+                    "confidence": order.confidence,
+                    "window_ts": order.window_ts,
+                    "order_type": order_type_tag,
+                    "agent_votes": votes_payload,
+                    "confidence_breakdown": conf_payload,
+                    "window_delta_pct": round(window.delta_pct, 4),
+                })
             self._dashboard.push_log(
-                "TRADE", "executor",
-                f"{'[PAPER] ' if order.is_paper else ''}BTC TRADE {order.direction} "
+                "INFO" if is_live_gtc else "TRADE", "executor",
+                f"{'[PAPER] ' if order.is_paper else ''}BTC "
+                f"{'GTC PLACED' if is_live_gtc else f'TRADE {order.direction}'} "
                 f"[{order_type_tag}] @ {order.price:.3f} × ${order.size_usd:.2f} "
                 f"(conf={order.confidence:.0f})"
+                + (" — awaiting fill" if is_live_gtc else "")
             )
             asyncio.create_task(trade_db.record_trade(
                 order_id=order.order_id,
@@ -1133,6 +1204,7 @@ class PolyOracle:
                         self._dashboard.push("trade_executed", {
                             "order_id": order.order_id,
                             "market": order.market_slug,
+                            "asset": "BTC",
                             "direction": order.direction,
                             "price": order.filled_price,
                             "size_usd": order.size_usd,
@@ -1140,6 +1212,12 @@ class PolyOracle:
                             "window_ts": order.window_ts,
                             "order_type": "GTC_FILLED",
                         })
+                        self._dashboard.push_log(
+                            "TRADE", "executor",
+                            f"BTC GTC FILLED {order.direction} "
+                            f"@ {order.filled_price:.3f} × ${order.size_usd:.2f} "
+                            f"(conf={order.confidence:.0f})"
+                        )
                         break
 
             for order_id in btc_cancelled:
@@ -1166,6 +1244,12 @@ class PolyOracle:
                             "window_ts": order.window_ts,
                             "order_type": "GTC_FILLED",
                         })
+                        self._dashboard.push_log(
+                            "TRADE", "executor",
+                            f"ETH GTC FILLED {order.direction} "
+                            f"@ {order.filled_price:.3f} × ${order.size_usd:.2f} "
+                            f"(conf={order.confidence:.0f})"
+                        )
                         break
 
             for order_id in eth_cancelled:
@@ -1247,14 +1331,14 @@ class PolyOracle:
                 continue
 
             won = order.direction == actual_direction
-            # Use size_shares (= size_usd / price, set at order creation) not
-            # filled_shares, which can be a stale partial-fill count if the GTC
-            # order continued filling after our poll accepted a partial.
-            # The claimer will overwrite pnl in the DB with the real redeemed amount.
+            # Use actual cost (filled_shares × filled_price) for partial GTC fills.
+            # For complete fills / paper orders, falls back to size_usd.
+            # The claimer will overwrite pnl in the DB with the real redeemed amount for wins.
+            actual_cost = _order_actual_cost(order)
             pnl = (
-                (order.size_shares - order.size_usd)
+                (order.filled_shares - actual_cost)
                 if won
-                else -(order.size_usd + order.fee_usd)
+                else -(actual_cost + order.fee_usd)
             )
 
             self._claimer.schedule_claim(order, actual_direction)
@@ -1280,7 +1364,7 @@ class PolyOracle:
                     f"LOSS -${abs(pnl):.2f} | BTC {order.direction} | size=${order.size_usd:.2f} | conf={order.confidence:.0f}"
                 )
 
-            self._exposure.close_position(order.size_usd)
+            self._exposure.close_position(_order_actual_cost(order))
 
             asset = "ETH" if order.market_slug.startswith("eth") else "BTC"
             self._dashboard.push("trade_resolved", {
@@ -1391,11 +1475,11 @@ class PolyOracle:
                         logger.warning(f"BTC CLOB mid-price check failed: {exc}")
 
                     # CLOB 404 means the market closed its order book = resolved.
-                    # Retry get_market_winner up to 10 more times (5 min).
-                    # Polymarket's oracle can take 7-12 min after close to populate
+                    # Retry get_market_winner up to 20 more times (10 min).
+                    # Polymarket's oracle can take 12-20 min after close to populate
                     # the winner field, so we keep checking after the definitive 404.
                     if clob_404:
-                        for retry in range(10):
+                        for retry in range(20):
                             try:
                                 result = await rest.get_market_winner(market.condition_id)
                                 if result:
@@ -1479,10 +1563,11 @@ class PolyOracle:
                 continue
 
             won = order.direction == actual_direction
+            actual_cost = _order_actual_cost(order)
             pnl = (
-                (order.size_shares - order.size_usd)
+                (order.filled_shares - actual_cost)
                 if won
-                else -(order.size_usd + order.fee_usd)
+                else -(actual_cost + order.fee_usd)
             )
 
             self._eth_claimer.schedule_claim(order, actual_direction)
@@ -1507,7 +1592,7 @@ class PolyOracle:
                     "TRADE", "resolution",
                     f"LOSS -${abs(pnl):.2f} | ETH {order.direction} | size=${order.size_usd:.2f} | conf={order.confidence:.0f}"
                 )
-            self._exposure.close_position(order.size_usd)
+            self._exposure.close_position(_order_actual_cost(order))
 
             self._dashboard.push("eth_trade_resolved", {
                 "order_id": order.order_id,
@@ -1603,10 +1688,10 @@ class PolyOracle:
                         logger.warning(f"ETH CLOB mid-price check failed: {exc}")
 
                     # CLOB 404 means the market closed its order book = resolved.
-                    # Retry get_market_winner up to 10 more times (5 min).
-                    # Polymarket's oracle can take 7-12 min after close to populate the winner field.
+                    # Retry get_market_winner up to 20 more times (10 min).
+                    # Polymarket's oracle can take 12-20 min after close to populate the winner field.
                     if clob_404:
-                        for retry in range(10):
+                        for retry in range(20):
                             try:
                                 result = await rest.get_market_winner(market.condition_id)
                                 if result:
@@ -1678,7 +1763,11 @@ class PolyOracle:
             all_open = btc_active + btc_filled + eth_active + eth_filled
             self._exposure.reconcile(
                 true_count=len(all_open),
-                true_usd=sum(o.size_usd for o in all_open),
+                # Use actual filled cost for FILLED orders; intended size for ACTIVE
+                # (still in book, fill amount unknown).  Partial GTC fills inflate
+                # size_usd ($200 intended) vs actual cost ($6.50 filled), which would
+                # permanently block new trades until the order resolves.
+                true_usd=sum(_order_actual_cost(o) for o in all_open),
             )
 
             # Update balance from chain if live

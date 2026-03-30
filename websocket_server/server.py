@@ -49,7 +49,7 @@ class DashboardServer:
         self._last_state: dict[str, Any] = {}
 
         # Rolling history pushed to new clients on connect
-        # Keeps the last 100 resolved trade events (BTC + ETH combined)
+        # Keeps the last 500 resolved trade events (BTC + ETH combined)
         self._trade_history: list[dict] = []
         # Keeps the last 300 log messages
         self._log_buffer: list[dict] = []
@@ -66,8 +66,8 @@ class DashboardServer:
             # Track trade history for catch-up on new connect
             if msg_type in ("trade_resolved", "eth_trade_resolved"):
                 self._trade_history.append(msg)
-                if len(self._trade_history) > 100:
-                    self._trade_history = self._trade_history[-100:]
+                if len(self._trade_history) > 500:
+                    self._trade_history = self._trade_history[-500:]
         except asyncio.QueueFull:
             # Drop oldest message to make room
             try:

@@ -86,6 +86,7 @@ class PendingClaim:
     is_paper: bool
     scheduled_at: float    # epoch when claim was first scheduled
     attempts: int = 0
+    is_verification: bool = False  # True when local resolution said "lost" but we verify on-chain
 
 
 @dataclass
@@ -132,11 +133,38 @@ class Claimer:
     def schedule_claim(self, order: Order, actual_direction: str) -> None:
         """Schedule a winning claim. Only call for orders that won."""
         won = order.direction == actual_direction
+
+        # Actual cost = shares filled × fill price.
+        # order.size_usd is the *intended* position size — it is wrong for partial
+        # GTC fills where only a fraction of the intended shares got matched.
+        # Using the intended size would produce a huge phantom loss, e.g.:
+        #   intended=$200, filled=10 shares×$0.65=$6.50, redeemed=$9.98
+        #   wrong: 9.98−200=−$190.02   correct: 9.98−6.50=+$3.48
+        if order.filled_shares > 0 and (order.filled_price or order.price) > 0:
+            actual_cost_usd = round(
+                order.filled_shares * (order.filled_price or order.price), 2
+            )
+        else:
+            actual_cost_usd = order.size_usd  # fallback for paper / complete fills
+
+        is_verification = False
         if not won:
-            # Lost — nothing to claim, just record
-            pnl = -(order.size_usd + order.fee_usd)
+            # Record tentative loss immediately so the UI shows something.
+            pnl = -(actual_cost_usd + order.fee_usd)
             self._orders.mark_resolved(order.order_id, won=False, pnl=pnl)
-            return
+            # For live filled orders the local "lost" verdict may come from the
+            # Binance price fallback rather than the authoritative Polymarket oracle
+            # (which can take 7-12 min to settle, beyond our 5-min poll window).
+            # Schedule a verification redemption: if on-chain redemption yields USDC
+            # we actually won and P&L is corrected; if $0 after oracle settles the
+            # loss is confirmed.  Paper / unfilled orders have nothing to verify.
+            if order.is_paper or self._is_paper or order.status != OrderStatus.FILLED:
+                return
+            is_verification = True
+            logger.info(
+                f"Verification claim scheduled for local-loss order: "
+                f"{order.market_slug[:20]}... — on-chain result will be authoritative"
+            )
 
         if order.status != OrderStatus.FILLED:
             return
@@ -148,10 +176,11 @@ class Claimer:
             outcome=order.outcome,
             direction=order.direction,
             filled_shares=order.filled_shares,
-            size_usd=order.size_usd,
+            size_usd=actual_cost_usd,   # actual cost, not intended order size
             fee_usd=order.fee_usd,
             is_paper=order.is_paper,
             scheduled_at=time.time(),
+            is_verification=is_verification,
         )
         self._pending.append((claim, order))
         self._save_persisted()
@@ -387,16 +416,26 @@ class Claimer:
                 usdc_received = (balance_after - balance_before) / 1e6  # USDC has 6 decimals
 
                 if usdc_received < 0.01:
-                    # payoutDenominator > 0 AND $0 received means the position was
-                    # already fully redeemed (by ghost recovery, a previous session,
-                    # or the first attempt that succeeded on-chain but we missed).
-                    # Do NOT retry — there is nothing left to claim and each retry
-                    # burns MATIC gas with zero chance of success.
-                    logger.info(
-                        f"Claim {claim.order_id[:12]}... already redeemed "
-                        f"(payoutDenominator>0 but $0 received, "
-                        f"tx={tx_hash.hex()[:16]}...) — marking complete"
-                    )
+                    if claim.is_verification:
+                        # payoutDenominator > 0 AND $0 received for a "lost" order
+                        # means the oracle confirmed our local direction was correct —
+                        # the position is genuinely worthless.
+                        logger.info(
+                            f"Claim {claim.order_id[:12]}... on-chain confirmed loss "
+                            f"(payoutDenominator>0, $0 received, "
+                            f"tx={tx_hash.hex()[:16]}...) — loss recorded is correct"
+                        )
+                    else:
+                        # payoutDenominator > 0 AND $0 received means the position was
+                        # already fully redeemed (by ghost recovery, a previous session,
+                        # or the first attempt that succeeded on-chain but we missed).
+                        # Do NOT retry — there is nothing left to claim and each retry
+                        # burns MATIC gas with zero chance of success.
+                        logger.info(
+                            f"Claim {claim.order_id[:12]}... already redeemed "
+                            f"(payoutDenominator>0 but $0 received, "
+                            f"tx={tx_hash.hex()[:16]}...) — marking complete"
+                        )
                     return True  # Treat as done — remove from pending, stop retrying
 
                 # Use actual on-chain USDC received to compute real P&L —
@@ -413,8 +452,9 @@ class Claimer:
                     actual_direction=claim.direction,
                     pnl=real_net_pnl,
                 ))
+                prefix = "[CLAIM ✓ — FALSE POSITIVE CORRECTED]" if claim.is_verification else "[CLAIM ✓]"
                 logger.claim(  # type: ignore[attr-defined]
-                    f"[CLAIM ✓] {claim.market_slug[:24]} | "
+                    f"{prefix} {claim.market_slug[:24]} | "
                     f"+${usdc_received:.2f} USDC redeemed | "
                     f"net P&L: {real_net_pnl:+.2f} (tx={tx_hash.hex()[:16]}...)"
                 )
