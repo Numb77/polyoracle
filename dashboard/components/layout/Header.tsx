@@ -4,22 +4,75 @@ import { useEffect, useRef, useState } from "react";
 import { useBotContext } from "@/app/providers";
 import { cn, formatBtcPrice, getCircuitColor } from "@/lib/utils";
 
+const ASSET_COLOR: Record<string, string> = {
+	BTC: "text-accent-green",
+	ETH: "text-indigo-400",
+	SOL: "text-purple-400",
+	DOGE: "text-yellow-400",
+	XRP: "text-sky-400",
+};
+
+function formatPrice(symbol: string, price: number): string {
+	if (symbol === "BTC") return formatBtcPrice(price);
+	return price.toLocaleString("en-US", {
+		minimumFractionDigits: 2,
+		maximumFractionDigits: price >= 100 ? 2 : 4,
+	});
+}
+
+function AssetTicker({ symbol }: { symbol: string }) {
+	const { state } = useBotContext();
+	const assetState = state.assets[symbol];
+	const tick = assetState?.lastTick ?? null;
+	const win = assetState?.window ?? null;
+	const prevPrice = useRef<number | null>(null);
+	const [flash, setFlash] = useState("");
+
+	useEffect(() => {
+		if (!tick) return;
+		if (prevPrice.current !== null && prevPrice.current !== tick.price) {
+			setFlash(tick.price > prevPrice.current ? "flash-green" : "flash-red");
+			const t = setTimeout(() => setFlash(""), 500);
+			return () => clearTimeout(t);
+		}
+		prevPrice.current = tick.price;
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [tick?.price]);
+
+	if (!tick) return null;
+
+	const color = ASSET_COLOR[symbol] ?? "text-zinc-400";
+
+	return (
+		<div className="flex items-center gap-2">
+			<span className={`text-xs font-bold ${color}`}>{symbol}</span>
+			<span className={cn("text-lg font-semibold price-display", flash)}>
+				{formatPrice(symbol, tick.price)}
+			</span>
+			{win && (
+				<span
+					className={`text-xs font-mono ${
+						win.delta_pct >= 0 ? "text-accent-green" : "text-accent-red"
+					}`}
+				>
+					{win.delta_pct >= 0 ? "+" : ""}
+					{win.delta_pct.toFixed(3)}%
+				</span>
+			)}
+		</div>
+	);
+}
+
 export function Header() {
 	const { state } = useBotContext();
-	const {
-		connected,
-		lastTick,
-		ethLastTick,
-		circuit,
-		window: win,
-		ethWindow,
-		portfolio,
-	} = state;
+	const { connected, circuit, portfolio } = state;
 	const [clock, setClock] = useState("");
-	const [btcFlash, setBtcFlash] = useState("");
-	const [ethFlash, setEthFlash] = useState("");
-	const prevBtcPrice = useRef<number | null>(null);
-	const prevEthPrice = useRef<number | null>(null);
+
+	const assetSymbols = Object.keys(state.assets);
+	// Use BTC window for the global countdown (first asset fallback)
+	const win = state.assets["BTC"]?.window ?? state.assets[assetSymbols[0]]?.window ?? null;
+	const remaining = win?.remaining_sec ?? 0;
+	const progress = win ? ((300 - remaining) / 300) * 100 : 0;
 
 	useEffect(() => {
 		const fmt = () =>
@@ -28,41 +81,6 @@ export function Header() {
 		const id = setInterval(fmt, 1000);
 		return () => clearInterval(id);
 	}, []);
-
-	// Flash BTC price on change
-	useEffect(() => {
-		if (!lastTick) return;
-		if (
-			prevBtcPrice.current !== null &&
-			prevBtcPrice.current !== lastTick.price
-		) {
-			const dir =
-				lastTick.price > prevBtcPrice.current ? "flash-green" : "flash-red";
-			setBtcFlash(dir);
-			const t = setTimeout(() => setBtcFlash(""), 500);
-			return () => clearTimeout(t);
-		}
-		prevBtcPrice.current = lastTick.price;
-	}, [lastTick?.price, lastTick]);
-
-	// Flash ETH price on change
-	useEffect(() => {
-		if (!ethLastTick) return;
-		if (
-			prevEthPrice.current !== null &&
-			prevEthPrice.current !== ethLastTick.price
-		) {
-			const dir =
-				ethLastTick.price > prevEthPrice.current ? "flash-green" : "flash-red";
-			setEthFlash(dir);
-			const t = setTimeout(() => setEthFlash(""), 500);
-			return () => clearTimeout(t);
-		}
-		prevEthPrice.current = ethLastTick.price;
-	}, [ethLastTick?.price, ethLastTick]);
-
-	const remaining = win?.remaining_sec ?? 0;
-	const progress = win ? ((300 - remaining) / 300) * 100 : 0;
 
 	return (
 		<header
@@ -103,61 +121,16 @@ export function Header() {
 				)}
 			</div>
 
-			{/* Center: BTC + ETH prices + window countdown */}
-			<div className="flex items-center gap-5 font-mono">
-				{/* BTC */}
-				{lastTick && (
-					<div className="flex items-center gap-2">
-						<span className="text-xs font-bold text-accent-green">BTC</span>
-						<span
-							className={cn("text-lg font-semibold price-display", btcFlash)}
-						>
-							{formatBtcPrice(lastTick.price)}
-						</span>
-						{win && (
-							<span
-								className={`text-xs font-mono ${
-									win.delta_pct >= 0 ? "text-accent-green" : "text-accent-red"
-								}`}
-							>
-								{win.delta_pct >= 0 ? "+" : ""}
-								{win.delta_pct.toFixed(3)}%
-							</span>
-						)}
+			{/* Center: all asset prices + window countdown */}
+			<div className="flex items-center gap-4 font-mono flex-wrap">
+				{assetSymbols.map((sym, i) => (
+					<div key={sym} className="flex items-center gap-4">
+						{i > 0 && <div className="w-px h-5 bg-zinc-700" />}
+						<AssetTicker symbol={sym} />
 					</div>
-				)}
+				))}
 
-				{/* Divider */}
-				{lastTick && ethLastTick && <div className="w-px h-5 bg-zinc-700" />}
-
-				{/* ETH */}
-				{ethLastTick && (
-					<div className="flex items-center gap-2">
-						<span className="text-xs font-bold text-indigo-400">ETH</span>
-						<span
-							className={cn("text-lg font-semibold price-display", ethFlash)}
-						>
-							{ethLastTick.price.toLocaleString("en-US", {
-								minimumFractionDigits: 2,
-								maximumFractionDigits: 2,
-							})}
-						</span>
-						{ethWindow && (
-							<span
-								className={`text-xs font-mono ${
-									ethWindow.delta_pct >= 0
-										? "text-accent-green"
-										: "text-accent-red"
-								}`}
-							>
-								{ethWindow.delta_pct >= 0 ? "+" : ""}
-								{ethWindow.delta_pct.toFixed(3)}%
-							</span>
-						)}
-					</div>
-				)}
-
-				{/* Window countdown (BTC) */}
+				{/* Window countdown */}
 				{win && (
 					<div className="flex items-center gap-2 text-xs border-l border-zinc-700 pl-4 ml-1">
 						<span className="text-text-secondary uppercase">{win.phase}</span>

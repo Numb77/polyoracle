@@ -96,10 +96,17 @@ class PolyOracle:
     held on this class and used by all lanes.
     """
 
-    def __init__(self, paper_mode: bool | None = None) -> None:
+    def __init__(self, paper_mode: bool | None = None, exclude: list[str] | None = None) -> None:
         # Override paper mode if explicitly specified
         if paper_mode is not None:
             cfg.paper_mode = paper_mode
+
+        # Apply CLI exclusions — upper-case for safe comparison
+        if exclude:
+            excluded = {s.upper() for s in exclude}
+            cfg._excluded_assets = excluded
+        else:
+            cfg._excluded_assets = set()
 
         self._running = False
         self._current_window_ts = 0
@@ -131,8 +138,12 @@ class PolyOracle:
         self._balance = initial_balance  # shared USDC pool for all assets
 
         # ── Per-asset lanes ──────────────────────────────────────────────────
+        excluded = getattr(cfg, "_excluded_assets", set())
         self._lanes: dict[str, AssetLane] = {}
         for asset_cfg in cfg.assets:
+            if asset_cfg.symbol.upper() in excluded:
+                logger.info(f"Skipping asset (excluded via --exclude): {asset_cfg.symbol}")
+                continue
             lane = AssetLane.create(
                 config=asset_cfg,
                 poly_ws=self._poly_ws,
@@ -1283,7 +1294,8 @@ class PolyOracle:
 @click.option("--paper/--live", default=None, help="Override paper/live mode from .env")
 @click.option("--log-level", default=None, help="Override log level")
 @click.option("--with-dashboard/--no-dashboard", default=True, help="Launch Next.js dashboard alongside the bot")
-def cli_main(paper: bool | None, log_level: str | None, with_dashboard: bool) -> None:
+@click.option("--exclude", multiple=True, metavar="SYMBOL", help="Exclude an asset (repeatable: --exclude ETH --exclude SOL)")
+def cli_main(paper: bool | None, log_level: str | None, with_dashboard: bool, exclude: tuple[str, ...]) -> None:
     """PolyOracle — Autonomous Polymarket BTC prediction market bot."""
     import subprocess
     import os as _os
@@ -1296,11 +1308,14 @@ def cli_main(paper: bool | None, log_level: str | None, with_dashboard: bool) ->
     if paper is not None:
         _os.environ["PAPER_MODE"] = "true" if paper else "false"
 
+    excluded_set = {s.upper() for s in exclude}
+    active_assets = [a.symbol for a in cfg.assets if a.symbol.upper() not in excluded_set]
     logger.info(
         f"PolyOracle starting | "
         f"mode={'PAPER' if cfg.paper_mode else 'LIVE'} | "
         f"confidence_threshold={cfg.min_confidence_score} | "
-        f"assets={[a.symbol for a in cfg.assets]}"
+        f"assets={active_assets}"
+        + (f" | excluded={sorted(excluded_set)}" if excluded_set else "")
     )
 
     # Launch dashboard as a child process
@@ -1319,7 +1334,7 @@ def cli_main(paper: bool | None, log_level: str | None, with_dashboard: bool) ->
         else:
             logger.warning("dashboard/package.json not found — skipping dashboard launch")
 
-    bot = PolyOracle(paper_mode=paper)
+    bot = PolyOracle(paper_mode=paper, exclude=list(exclude) if exclude else None)
 
     # Handle Ctrl+C gracefully
     loop = asyncio.get_event_loop()
