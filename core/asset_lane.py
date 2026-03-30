@@ -108,10 +108,6 @@ class AssetLane:
             wallet=wallet,  # type: ignore[arg-type]
             order_manager=order_manager,
             fee_calculator=fee_calc,
-        ) if wallet else PolymarketExecutor(
-            wallet=None,  # type: ignore[arg-type]
-            order_manager=order_manager,
-            fee_calculator=fee_calc,
         )
 
         return cls(

@@ -16,38 +16,42 @@ function useWindowCountdown(windowTs: number) {
 	useEffect(() => {
 		const id = setInterval(() => setRemaining(calc), 1000);
 		return () => clearInterval(id);
-	}, [calc]);
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [windowTs]);
 	return remaining;
 }
 
 // ── Market label helper ────────────────────────────────────────────────────────
 
+const ASSET_COLORS: Record<string, string> = {
+	BTC: "bg-accent-green/10 text-accent-green border border-accent-green/30",
+	ETH: "bg-indigo-500/10 text-indigo-400 border border-indigo-400/30",
+	SOL: "bg-purple-500/10 text-purple-400 border border-purple-400/30",
+	DOGE: "bg-yellow-500/10 text-yellow-400 border border-yellow-400/30",
+	XRP: "bg-sky-500/10 text-sky-400 border border-sky-400/30",
+};
+
 function AssetBadge({
 	asset,
 	className,
 }: {
-	asset: "BTC" | "ETH";
+	asset: string;
 	className?: string;
 }) {
+	const colors =
+		ASSET_COLORS[asset] ??
+		"bg-zinc-500/10 text-zinc-400 border border-zinc-400/30";
 	return (
-		<span
-			className={cn(
-				"text-[10px] font-bold px-1.5 py-0.5 rounded font-mono",
-				asset === "BTC"
-					? "bg-accent-green/10 text-accent-green border border-accent-green/30"
-					: "bg-indigo-500/10 text-indigo-400 border border-indigo-400/30",
-				className,
-			)}
-		>
+		<span className={cn("text-[10px] font-bold px-1.5 py-0.5 rounded font-mono", colors, className)}>
 			{asset}
 		</span>
 	);
 }
 
-function marketLabel(market: string, asset?: "BTC" | "ETH"): string {
-	// "btc-updown-5m-1774115100" → "BTC  5m · 17:45"
-	// Prefer asset from payload; fall back to parsing the slug
-	const a = asset ?? (market.startsWith("eth") ? "ETH" : "BTC");
+function marketLabel(market: string, asset?: string): string {
+	// "btc-updown-5m-1774115100" → "BTC · 17:45"
+	// Prefer asset from payload; fall back to uppercasing the slug prefix
+	const a = asset ?? market.split("-")[0].toUpperCase();
 	const ts = parseInt(market.split("-").pop() ?? "0", 10);
 	if (!ts) return a;
 	const d = new Date(ts * 1000);

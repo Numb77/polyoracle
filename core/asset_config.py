@@ -11,11 +11,13 @@ the ASSETS_JSON env var).
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AssetConfig(BaseModel):
     """Configuration for a single tradable asset."""
+
+    model_config = ConfigDict(frozen=True)
 
     symbol: str = Field(description="Uppercase ticker: BTC, ETH, SOL, …")
     binance_symbol: str = Field(description="Binance spot pair: BTCUSDT, …")
@@ -27,9 +29,6 @@ class AssetConfig(BaseModel):
         description="Fallback search terms for CLOB market resolution",
     )
     enabled: bool = True
-
-    class Config:
-        frozen = True
 
 
 def _build_binance_ws_url(symbol: str) -> str:
@@ -70,9 +69,12 @@ DEFAULT_ASSETS: list[AssetConfig] = [
         symbol="DOGE",
         binance_symbol="DOGEUSDT",
         binance_ws_url=_build_binance_ws_url("DOGEUSDT"),
+        # Chainlink DOGE/USD feed on Polygon was deprecated — disabled until a
+        # replacement proxy is confirmed.
         chainlink_proxy="0xbaf9327b6564454F4a3364C33eFeEf032b4b4444",
         slug_prefix="doge",
         clob_keywords=["doge", "dogecoin"],
+        enabled=False,
     ),
     AssetConfig(
         symbol="XRP",

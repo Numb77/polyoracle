@@ -7,10 +7,13 @@ import type {
 	AssetState,
 	BotState,
 	ClaimsRecoveryResult,
+	ConfidenceBreakdown,
+	Consensus,
 	LogEntry,
 	PriceTick,
 	TradeExecuted,
 	TradeResolved,
+	WindowState,
 	WsMessage,
 } from "@/lib/types";
 
@@ -114,21 +117,18 @@ function botReducer(state: BotState, action: Action): BotState {
 				}
 
 				case "window_state": {
-					const ws = data as BotState["window"];
-					const asset = (ws as any)?.asset || "BTC";
-					return withAsset(state, asset, { window: ws });
+					const ws = data as WindowState;
+					return withAsset(state, ws.asset ?? "BTC", { window: ws });
 				}
 
 				case "agent_votes": {
-					const agents = data as BotState["agents"];
-					const asset = (agents as any)?.asset || "BTC";
-					return withAsset(state, asset, { agents });
+					const agents = data as Consensus;
+					return withAsset(state, agents.asset ?? "BTC", { agents });
 				}
 
 				case "confidence": {
-					const confidence = data as BotState["confidence"];
-					const asset = (confidence as any)?.asset || "BTC";
-					return withAsset(state, asset, { confidence });
+					const confidence = data as ConfidenceBreakdown;
+					return withAsset(state, confidence.asset ?? "BTC", { confidence });
 				}
 
 				case "trade_executed": {
