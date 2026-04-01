@@ -158,19 +158,20 @@ function botReducer(state: BotState, action: Action): BotState {
 					const resolved = data as TradeResolved;
 					const asset = resolved.asset || "BTC";
 					const assetState = getAsset(state, asset);
-					// Enrich resolved trade with snapshot data from active position
+					// Fall back to activePos only for fields the server didn't provide
+					// (e.g. opened_at which is client-side only).
 					const activePos = assetState.activePositions.find(
 						(p) => p.order_id === resolved.order_id,
 					);
 					const enriched: TradeResolved = {
 						...resolved,
-						price: activePos?.price,
-						size_usd: activePos?.size_usd,
+						price: resolved.price ?? activePos?.price,
+						size_usd: resolved.size_usd ?? activePos?.size_usd,
 						confidence: resolved.confidence ?? activePos?.confidence,
-						order_type: activePos?.order_type,
-						agent_votes: activePos?.agent_votes,
-						confidence_breakdown: activePos?.confidence_breakdown,
-						window_delta_pct: activePos?.window_delta_pct,
+						order_type: resolved.order_type ?? activePos?.order_type,
+						agent_votes: resolved.agent_votes ?? activePos?.agent_votes,
+						confidence_breakdown: resolved.confidence_breakdown ?? activePos?.confidence_breakdown,
+						window_delta_pct: resolved.window_delta_pct ?? activePos?.window_delta_pct,
 						opened_at: activePos?.opened_at,
 					};
 					const newState = withAsset(state, asset, {

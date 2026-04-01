@@ -49,7 +49,8 @@ class TokenResolver:
     Caches resolution to avoid repeated API calls.
     """
 
-    CACHE_TTL = 30.0   # Cache for 30 seconds
+    CACHE_TTL = 30.0          # TTL for the current window (refreshed on reprice)
+    PAST_WINDOW_CACHE_TTL = 7200.0  # Past windows: keep for 2h (needed for resolution)
 
     def __init__(
         self,
@@ -71,11 +72,13 @@ class TokenResolver:
 
     async def resolve_window(self, window_ts: int) -> ResolvedMarket | None:
         """Resolve the market for a specific window timestamp."""
-        # Check cache
+        # Check cache — past windows use a longer TTL since their condition_id is immutable
         cached = self._cache.get(window_ts)
         if cached:
             market, cached_at = cached
-            if time.time() - cached_at < self.CACHE_TTL:
+            is_past = window_ts < get_window_ts()
+            ttl = self.PAST_WINDOW_CACHE_TTL if is_past else self.CACHE_TTL
+            if time.time() - cached_at < ttl:
                 return market
 
         slug = f"{self._asset}-updown-5m-{window_ts}"

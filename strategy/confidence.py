@@ -73,6 +73,7 @@ class ConfidenceEngine:
         polymarket_alignment: float = 0.0,  # [-1,+1]: PM odds aligned with our direction
         elapsed_sec: float = 0.0,          # Seconds since window opened
         cross_asset_alignment: float = 0.0, # [-1,+1]: other asset moving same direction
+        opposing_conviction: float = 0.0,   # max raw conviction of non-muted agents opposing direction
     ) -> ConfidenceBreakdown:
         """
         Compute confidence score.
@@ -112,15 +113,27 @@ class ConfidenceEngine:
         else:
             agent_pts = 0.0
 
-        # ── 3. Window delta decisiveness (0-25 pts) ──────────────────────────
-        # Raised from 20 → 25 max (delta is the primary signal for 5-min windows).
-        # Linear interpolation within bands to avoid point cliffs.
+        # ── 3. Window delta decisiveness (0-30 pts) ──────────────────────────
+        # Data shows delta ≥ 0.15% → 100% win rate; delta < 0.15% → 41% win rate
+        # in recent history. Reward larger, more decisive moves significantly more:
+        #   < 0.02%  →  0–4 pts   (noise)
+        #   0.02–0.05% →  4–12 pts
+        #   0.05–0.10% → 12–22 pts
+        #   0.10–0.15% → 22–27 pts (was capped at 25 for ≥ 0.10%)
+        #   0.15–0.20% → 27–30 pts (bonus for high-conviction moves)
+        #   ≥ 0.20%  → 30 pts     (cap raised from 25)
         abs_delta = abs(window_delta_pct)
-        if abs_delta >= 0.10:
-            delta_pts = 25.0
+        if abs_delta >= 0.20:
+            delta_pts = 30.0
+        elif abs_delta >= 0.15:
+            # 27 → 30 pts linearly across 0.15–0.20%
+            delta_pts = 27.0 + (abs_delta - 0.15) / 0.05 * 3.0
+        elif abs_delta >= 0.10:
+            # 22 → 27 pts linearly across 0.10–0.15%
+            delta_pts = 22.0 + (abs_delta - 0.10) / 0.05 * 5.0
         elif abs_delta >= 0.05:
-            # 12 → 25 pts linearly across 0.05–0.10%
-            delta_pts = 12.0 + (abs_delta - 0.05) / 0.05 * 13.0
+            # 12 → 22 pts linearly across 0.05–0.10%
+            delta_pts = 12.0 + (abs_delta - 0.05) / 0.05 * 10.0
         elif abs_delta >= 0.02:
             # 4 → 12 pts linearly across 0.02–0.05%
             delta_pts = 4.0 + (abs_delta - 0.02) / 0.03 * 8.0
@@ -133,23 +146,38 @@ class ConfidenceEngine:
         # signal because there's less noise drowning it out.
         # Reference: 0.05% ATR is "normal" — below this, delta scores higher.
         # Scale is capped at 2.0× to avoid over-weighting micro-moves.
+        # Cap raised to 30 to match the new maximum delta contribution.
         if regime_volatility > 0:
             vol_scale = min(0.05 / regime_volatility, 2.0)
             vol_scale = max(vol_scale, 1.0)   # only boost, never penalise
-            delta_pts = min(delta_pts * vol_scale, 25.0)
+            delta_pts = min(delta_pts * vol_scale, 30.0)
 
-        # ── 4. Market regime bonus (0-15 pts) ────────────────────────────────
-        regime_pts = float(max(0.0, min(15.0, regime_bonus)))
+        # ── 4. Market regime score (-8..+15 pts) ──────────────────────────────
+        # TRENDING markets get a positive bonus (sustained directional moves).
+        # VOLATILE/whipsaw markets get a penalty: a 5-minute bet is close to a
+        # coin-flip when price is reversing rapidly.  The regime detector already
+        # identifies this — apply an -8 pt penalty so we only trade in genuine
+        # trends, not in choppy conditions that historically lose more often.
+        if regime_bonus < 0:
+            # Negative bonus signals VOLATILE regime from detect_regime()
+            regime_pts = max(-8.0, regime_bonus)
+        else:
+            regime_pts = float(min(15.0, regime_bonus))
 
-        # ── 5. Momentum acceleration bonus (0-5 pts) ─────────────────────────
-        # If delta is growing in the same direction since last evaluation,
-        # the move is accelerating — higher certainty for late-window resolution.
+        # ── 5. Momentum bonus/penalty (-4..+5 pts) ───────────────────────────
+        # If delta is growing: +pts (accelerating, more reliable).
+        # If delta is SHRINKING: -pts (the move that triggered the signal is
+        # already fading — the opportunity may be passing by entry time).
         # delta_acceleration = current_delta - prev_delta (same sign = accelerating).
         momentum_pts = 0.0
         same_direction = (window_delta_pct * delta_acceleration) > 0
         if same_direction and abs(delta_acceleration) >= 0.015:
             # Acceleration of 0.015% → 2.5 pts, 0.03%+ → 5 pts (capped)
             momentum_pts = min(5.0, abs(delta_acceleration) / 0.03 * 5.0)
+        elif not same_direction and abs(delta_acceleration) >= 0.020:
+            # Deceleration: the window delta is shrinking — momentum is fading.
+            # Penalty scales from -2 at 0.020% to -4 at 0.040%+.
+            momentum_pts = -min(4.0, abs(delta_acceleration) / 0.04 * 4.0)
 
         # ── 6. Time-decay bonus (0-10 pts) ───────────────────────────────────
         # As the window deadline approaches, prediction market odds become more
@@ -205,10 +233,25 @@ class ConfidenceEngine:
             # Diverging: meaningful penalty (-8 at full divergence)
             cross_asset_pts = 8.0 * cross_asset_alignment  # negative value
 
+        # ── Opposing conviction penalty (-12..0 pts) ──────────────────────────
+        # A non-muted agent opposing our direction with high raw conviction signals
+        # genuine uncertainty — even if its long-run accuracy is modest, a strong
+        # local conviction (e.g. RSI at extreme, heavy order book pressure) reflects
+        # current conditions that historical accuracy averages can mask.
+        # We penalise rather than veto so the effect is graduated, not binary.
+        if opposing_conviction >= 0.85:
+            opposing_penalty = 12.0
+        elif opposing_conviction >= 0.70:
+            opposing_penalty = 7.0
+        elif opposing_conviction >= 0.55:
+            opposing_penalty = 3.0
+        else:
+            opposing_penalty = 0.0
+
         # ── Total ─────────────────────────────────────────────────────────────
         total = (signal_pts + agent_pts + delta_pts + regime_pts
                  + momentum_pts + time_decay_pts + persistence_pts
-                 + cross_asset_pts)
+                 + cross_asset_pts - opposing_penalty)
         total = max(0.0, min(100.0, total))
 
         breakdown = ConfidenceBreakdown(

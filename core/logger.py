@@ -45,6 +45,7 @@ _CONSOLE_THEME = Theme(
         "logging.level.debug": "dim white",
         "logging.level.info": "white",
         "logging.level.trade": "bold green",
+        "logging.level.claim": "bold magenta",
         "logging.level.warning": "bold yellow",
         "logging.level.error": "bold red",
         "logging.level.critical": "bold red blink",

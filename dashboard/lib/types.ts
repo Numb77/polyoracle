@@ -126,15 +126,22 @@ export interface TradeResolved {
 	won: boolean;
 	pnl: number;
 	window_ts: number;
-	// Carried forward from TradeExecuted for the detail view:
 	price?: number;
 	size_usd?: number;
+	fee_usd?: number;
 	confidence?: number;
 	order_type?: string;
 	agent_votes?: AgentVote[];
 	confidence_breakdown?: ConfidenceBreakdown;
 	window_delta_pct?: number;
 	opened_at?: number;
+	// Fill details:
+	filled_shares?: number;
+	filled_price?: number;
+	// Resolution details:
+	close_price?: number;
+	price_move_pct?: number;
+	resolution_method?: "oracle" | "clob" | "binance" | "paper";
 }
 
 // ── Portfolio ─────────────────────────────────────────────────────────────────

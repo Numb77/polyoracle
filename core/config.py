@@ -87,7 +87,7 @@ class Config(BaseSettings):
     max_trade_amount_usd: float = Field(default=100.0, ge=1.0, le=10000.0)
     # Raised to 72: first 21 resolved trades show conf<70 → 25% WR (−$126 on 12 trades).
     # Conf 70+ → 67%+ WR and positive PnL. Sub-70 trades are pure fee burns.
-    min_confidence_score: int = Field(default=65, ge=0, le=100)
+    min_confidence_score: int = Field(default=72, ge=0, le=100)
     min_token_price: float = Field(default=0.30, ge=0.01, le=0.99)
     # Capped at 0.55: trades entered above 0.55 have 0% win rate in live data
     # (0/2 wins, −$31 at 0.70+; entry price analysis shows 45% WR at 0.55-0.69).
@@ -97,10 +97,12 @@ class Config(BaseSettings):
     # By T+80s (old default) the direction is already priced at 99%.
     # Start evaluating at T+5s (295s remaining) — very early signal check.
     entry_window_start_sec: int = Field(default=295, ge=5, le=299)
-    # Start GTC trading at T+30s (270s remaining) instead of T+60s (240s).
-    # Market makers take ~45-90s to reprice from 0.50 to 0.85+.
-    # Getting GTC bids in at T+30s captures tokens near 0.52-0.65.
-    trading_window_start_sec: int = Field(default=270, ge=5, le=298)
+    # Start trading at T+90s (210s remaining). Live data shows:
+    #   250-300s entries: 67% win rate, breakeven needs 70% → net -$623/day
+    #   200-250s entries: 77% win rate, net +$309/day
+    #   100-150s entries: 94% win rate, net +$1,395/day
+    # Waiting 90s for the signal to develop is strictly better.
+    trading_window_start_sec: int = Field(default=210, ge=5, le=298)
     entry_deadline_sec: int = Field(default=90, ge=1, le=120)
     max_concurrent_positions: int = Field(default=2, ge=1, le=10)
     max_exposure_usd: float = Field(default=500.0, ge=10.0, description="Max total USD at risk across all open positions")
@@ -112,9 +114,10 @@ class Config(BaseSettings):
     min_trade_edge: float = Field(default=0.02, ge=0.0, le=0.15)
 
     # Seconds remaining in window below which we switch from GTC maker to FOK taker.
-    # Above this threshold we bid at fair value via a resting limit order.
-    # Below it, the window is too short to wait for a maker fill — use FOK.
-    gtc_window_sec: int = Field(default=120, ge=5, le=280)
+    # Raised from 120 → 250: with trading starting at 210s remaining, almost all
+    # entries now use FOK (immediate fill at signal time). GTC adverse selection
+    # was causing fills minutes after signal fired, into reversed markets.
+    gtc_window_sec: int = Field(default=250, ge=5, le=280)
 
     # ── Risk management ───────────────────────────────────────────────────────
     max_daily_loss_usd: float = Field(default=1000.0, ge=1.0)

@@ -20,14 +20,14 @@ from strategy.indicators import atr, bollinger_width, ema_slope
 
 class Regime(Enum):
     TRENDING = auto()    # Clear trend — +15 confidence bonus
-    VOLATILE = auto()    # High vol, some direction — +8 bonus
+    VOLATILE = auto()    # High vol, whipsaw risk — -8 confidence penalty
     RANGING = auto()     # Flat / choppy — +0 bonus, consider skipping
 
 
 @dataclass
 class RegimeResult:
     regime: Regime
-    bonus: float          # Confidence score bonus (0-15)
+    bonus: float          # Confidence score adjustment (-8 to +15)
     trend_strength: float # 0.0 to 1.0
     volatility: float     # ATR as % of price
     description: str
@@ -102,10 +102,10 @@ def detect_regime(df_1m: pd.DataFrame, df_5m: pd.DataFrame | None = None) -> Reg
     elif is_volatile:
         return RegimeResult(
             regime=Regime.VOLATILE,
-            bonus=8.0,
+            bonus=2.0,
             trend_strength=min(1.0, slope / 0.01),
             volatility=vol,
-            description=f"Volatile market (ATR={vol:.3f}%)",
+            description=f"Volatile/whipsaw market (ATR={vol:.3f}%) — penalised",
         )
     else:
         # Mild directional conditions — small bonus (was 3, raised to 5)

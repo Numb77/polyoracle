@@ -36,16 +36,18 @@ def _create_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS trades (
             id                   INTEGER PRIMARY KEY AUTOINCREMENT,
             order_id             TEXT    UNIQUE NOT NULL,
-            asset                TEXT    NOT NULL,          -- 'BTC' or 'ETH'
-            market               TEXT    NOT NULL,          -- full slug
+            asset                TEXT    NOT NULL,
+            market               TEXT    NOT NULL,
             direction            TEXT    NOT NULL,          -- 'UP' or 'DOWN'
             entry_price          REAL    NOT NULL,
             size_usd             REAL    NOT NULL,
+            fee_usd              REAL,                      -- fee paid at execution
             confidence           REAL    NOT NULL,
             window_ts            INTEGER NOT NULL,
             order_type           TEXT    NOT NULL,          -- 'GTC' or 'FOK'
+            entry_sec_remaining  REAL,                      -- seconds left in window at entry
             window_delta_pct     REAL,
-            open_price           REAL,                      -- BTC/ETH price at window open
+            open_price           REAL,                      -- asset price at window open
             agent_votes          TEXT,                      -- JSON array
             confidence_breakdown TEXT,                      -- JSON object
             created_at           REAL    NOT NULL,
@@ -53,6 +55,11 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             won                  INTEGER,                   -- NULL until resolved
             actual_direction     TEXT,
             pnl                  REAL,
+            filled_shares        REAL,                      -- actual shares received
+            filled_price         REAL,                      -- actual fill price
+            close_price          REAL,                      -- asset price at window close
+            price_move_pct       REAL,                      -- % move open→close
+            resolution_method    TEXT,                      -- 'oracle'/'clob'/'binance'/'paper'
             resolved_at          REAL
         )
     """)
@@ -65,17 +72,35 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add any columns introduced after the initial schema."""
+    migrations = [
+        ("open_price",          "ALTER TABLE trades ADD COLUMN open_price REAL"),
+        ("fee_usd",             "ALTER TABLE trades ADD COLUMN fee_usd REAL"),
+        ("entry_sec_remaining", "ALTER TABLE trades ADD COLUMN entry_sec_remaining REAL"),
+        ("filled_shares",       "ALTER TABLE trades ADD COLUMN filled_shares REAL"),
+        ("filled_price",        "ALTER TABLE trades ADD COLUMN filled_price REAL"),
+        ("close_price",         "ALTER TABLE trades ADD COLUMN close_price REAL"),
+        ("price_move_pct",      "ALTER TABLE trades ADD COLUMN price_move_pct REAL"),
+        ("resolution_method",   "ALTER TABLE trades ADD COLUMN resolution_method TEXT"),
+    ]
+    added = []
+    for col, sql in migrations:
+        try:
+            conn.execute(sql)
+            added.append(col)
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+    if added:
+        conn.commit()
+        logger.info(f"trade_db: migrated — added columns: {', '.join(added)}")
+
+
 def _init_db() -> None:
     conn = _get_conn()
     try:
         _create_schema(conn)
-        # Migrate existing databases that predate the open_price column
-        try:
-            conn.execute("ALTER TABLE trades ADD COLUMN open_price REAL")
-            conn.commit()
-            logger.info("trade_db: migrated — added open_price column")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+        _migrate(conn)
     finally:
         conn.close()
 
@@ -89,9 +114,11 @@ def _record_trade_sync(
     direction: str,
     entry_price: float,
     size_usd: float,
+    fee_usd: float | None,
     confidence: float,
     window_ts: int,
     order_type: str,
+    entry_sec_remaining: float | None,
     window_delta_pct: float | None,
     open_price: float | None,
     agent_votes: list | None,
@@ -101,13 +128,14 @@ def _record_trade_sync(
     try:
         conn.execute("""
             INSERT OR IGNORE INTO trades
-            (order_id, asset, market, direction, entry_price, size_usd, confidence,
-             window_ts, order_type, window_delta_pct, open_price,
-             agent_votes, confidence_breakdown, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (order_id, asset, market, direction, entry_price, size_usd, fee_usd,
+             confidence, window_ts, order_type, entry_sec_remaining,
+             window_delta_pct, open_price, agent_votes, confidence_breakdown, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            order_id, asset, market, direction, entry_price, size_usd, confidence,
-            window_ts, order_type, window_delta_pct, open_price,
+            order_id, asset, market, direction, entry_price, size_usd, fee_usd,
+            confidence, window_ts, order_type, entry_sec_remaining,
+            window_delta_pct, open_price,
             json.dumps(agent_votes) if agent_votes else None,
             json.dumps(confidence_breakdown) if confidence_breakdown else None,
             time.time(),
@@ -124,14 +152,28 @@ def _resolve_trade_sync(
     won: bool,
     actual_direction: str,
     pnl: float,
+    filled_shares: float | None,
+    filled_price: float | None,
+    close_price: float | None,
+    price_move_pct: float | None,
+    resolution_method: str | None,
 ) -> None:
     conn = _get_conn()
     try:
         conn.execute("""
             UPDATE trades
-            SET won = ?, actual_direction = ?, pnl = ?, resolved_at = ?
+            SET won = ?, actual_direction = ?, pnl = ?,
+                filled_shares = ?, filled_price = ?,
+                close_price = ?, price_move_pct = ?,
+                resolution_method = ?, resolved_at = ?
             WHERE order_id = ?
-        """, (int(won), actual_direction, pnl, time.time(), order_id))
+        """, (
+            int(won), actual_direction, pnl,
+            filled_shares, filled_price,
+            close_price, price_move_pct,
+            resolution_method, time.time(),
+            order_id,
+        ))
         conn.commit()
     except Exception as exc:
         logger.error(f"trade_db resolve_trade failed: {exc}")
@@ -151,6 +193,8 @@ async def record_trade(
     confidence: float,
     window_ts: int,
     order_type: str,
+    fee_usd: float | None = None,
+    entry_sec_remaining: float | None = None,
     window_delta_pct: float | None = None,
     open_price: float | None = None,
     agent_votes: list | None = None,
@@ -160,9 +204,30 @@ async def record_trade(
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(
         _executor, _record_trade_sync,
-        order_id, asset, market, direction, entry_price, size_usd, confidence,
-        window_ts, order_type, window_delta_pct, open_price, agent_votes, confidence_breakdown,
+        order_id, asset, market, direction, entry_price, size_usd, fee_usd,
+        confidence, window_ts, order_type, entry_sec_remaining,
+        window_delta_pct, open_price, agent_votes, confidence_breakdown,
     )
+
+
+def _update_trade_fill_sync(order_id: str, filled_shares: float, filled_price: float) -> None:
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "UPDATE trades SET filled_shares = ?, filled_price = ? WHERE order_id = ?",
+            (filled_shares, filled_price, order_id),
+        )
+        conn.commit()
+    except Exception as exc:
+        logger.error(f"trade_db update_trade_fill failed: {exc}")
+    finally:
+        conn.close()
+
+
+async def update_trade_fill(order_id: str, filled_shares: float, filled_price: float) -> None:
+    """Persist fill data as soon as a GTC order fills (before resolution)."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(_executor, _update_trade_fill_sync, order_id, filled_shares, filled_price)
 
 
 async def resolve_trade(
@@ -170,12 +235,18 @@ async def resolve_trade(
     won: bool,
     actual_direction: str,
     pnl: float,
+    filled_shares: float | None = None,
+    filled_price: float | None = None,
+    close_price: float | None = None,
+    price_move_pct: float | None = None,
+    resolution_method: str | None = None,
 ) -> None:
     """Update a trade record with the final outcome."""
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(
         _executor, _resolve_trade_sync,
         order_id, won, actual_direction, pnl,
+        filled_shares, filled_price, close_price, price_move_pct, resolution_method,
     )
 
 
@@ -186,12 +257,14 @@ def _load_resolved_trades_sync(asset: str | None, limit: int) -> list[dict]:
     conn = _get_conn()
     try:
         query = """
-            SELECT order_id, asset, direction, actual_direction,
-                   agent_votes, confidence, window_ts, won, pnl,
-                   entry_price, size_usd, order_type
+            SELECT order_id, asset, market, direction, actual_direction,
+                   agent_votes, confidence_breakdown, confidence, window_ts, won, pnl,
+                   entry_price, size_usd, fee_usd, order_type,
+                   entry_sec_remaining, window_delta_pct, open_price,
+                   filled_shares, filled_price, close_price, price_move_pct,
+                   resolution_method
             FROM trades
             WHERE actual_direction IS NOT NULL
-              AND agent_votes IS NOT NULL
         """
         params: list = []
         if asset:
@@ -264,7 +337,9 @@ def _load_unresolved_trades_sync(min_age_sec: int) -> list[dict]:
         cutoff = time.time() - min_age_sec
         rows = conn.execute("""
             SELECT order_id, asset, market, window_ts, direction,
-                   open_price, entry_price, size_usd, confidence
+                   open_price, entry_price, size_usd, fee_usd, confidence,
+                   filled_shares, filled_price,
+                   agent_votes, confidence_breakdown, window_delta_pct
             FROM trades
             WHERE won IS NULL
               AND created_at < ?

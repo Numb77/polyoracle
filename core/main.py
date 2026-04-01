@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 import sys
 import time
@@ -111,6 +112,7 @@ class PolyOracle:
         self._running = False
         self._current_window_ts = 0
         self._last_fill_check_tick: float = 0.0
+        self._ghost_recovery_running = False
 
         # ── Shared data layer ────────────────────────────────────────────────
         self._poly_ws = PolymarketWebSocket()
@@ -136,6 +138,11 @@ class PolyOracle:
         # Wallet (may be None in paper mode without private key)
         self._wallet: Wallet | None = None
         self._balance = initial_balance  # shared USDC pool for all assets
+
+        # Per-order execution metadata (agent_votes, confidence_breakdown, etc.)
+        # stored here so trade_resolved push is self-contained without a DB lookup.
+        # Entries are removed when the trade resolves or expires.
+        self._order_meta: dict[str, dict] = {}
 
         # ── Per-asset lanes ──────────────────────────────────────────────────
         excluded = getattr(cfg, "_excluded_assets", set())
@@ -283,6 +290,8 @@ class PolyOracle:
                 if r.get("won") is None or r.get("pnl") is None:
                     continue
                 asset = (r.get("asset") or "BTC").upper()
+                _av = r.get("agent_votes")
+                _cb = r.get("confidence_breakdown")
                 self._dashboard.push("trade_resolved", {
                     "order_id": r["order_id"],
                     "market": r.get("market", ""),
@@ -296,6 +305,15 @@ class PolyOracle:
                     "size_usd": float(r.get("size_usd") or 0),
                     "confidence": float(r.get("confidence") or 0),
                     "order_type": r.get("order_type"),
+                    "window_delta_pct": float(r["window_delta_pct"]) if r.get("window_delta_pct") is not None else None,
+                    "agent_votes": json.loads(_av) if isinstance(_av, str) else _av,
+                    "confidence_breakdown": json.loads(_cb) if isinstance(_cb, str) else _cb,
+                    "fee_usd": float(r["fee_usd"]) if r.get("fee_usd") is not None else None,
+                    "filled_shares": float(r["filled_shares"]) if r.get("filled_shares") else None,
+                    "filled_price": float(r["filled_price"]) if r.get("filled_price") else None,
+                    "close_price": float(r["close_price"]) if r.get("close_price") else None,
+                    "price_move_pct": float(r["price_move_pct"]) if r.get("price_move_pct") else None,
+                    "resolution_method": r.get("resolution_method"),
                 })
             if display_records:
                 logger.info(f"Dashboard trade history seeded from DB: {len(display_records)} trades")
@@ -330,27 +348,37 @@ class PolyOracle:
 
     async def _run_ghost_claim_recovery(self, startup: bool = False) -> None:
         """Fetch all unclaimed positions from Polymarket and redeem them."""
-        if startup:
-            await asyncio.sleep(10.0)
+        if self._ghost_recovery_running:
+            logger.info("Ghost recovery already in progress — skipping duplicate trigger")
+            return
+        self._ghost_recovery_running = True
+        try:
+            if startup:
+                await asyncio.sleep(10.0)
 
-        all_results = []
-        for lane in self._lanes.values():
-            results = await lane.claimer.recover_ghost_claims(self._wallet)
-            all_results.extend(results)
+            # All lanes share one wallet — scan once via the first available lane's
+            # claimer rather than once per lane (which would redundantly claim the
+            # same positions 4 times and create concurrent tx submissions).
+            first_lane = next(iter(self._lanes.values()), None)
+            if not first_lane:
+                return
+            all_results = await first_lane.claimer.recover_ghost_claims(self._wallet)
 
-        recovered_count = sum(1 for r in all_results if r.success)
-        recovered_usd = sum(r.claimed_usd for r in all_results if r.success)
-        pending_count = sum(1 for r in all_results if not r.success and r.error == "Not yet resolved on-chain")
+            recovered_count = sum(1 for r in all_results if r.success)
+            recovered_usd = sum(r.claimed_usd for r in all_results if r.success)
+            pending_count = sum(1 for r in all_results if not r.success and r.error == "Not yet resolved on-chain")
 
-        self._dashboard.push(
-            "claims_recovery_complete",
-            {
-                "recovered_count": recovered_count,
-                "recovered_usd": round(recovered_usd, 4),
-                "pending_count": pending_count,
-                "total_checked": len(all_results),
-            },
-        )
+            self._dashboard.push(
+                "claims_recovery_complete",
+                {
+                    "recovered_count": recovered_count,
+                    "recovered_usd": round(recovered_usd, 4),
+                    "pending_count": pending_count,
+                    "total_checked": len(all_results),
+                },
+            )
+        finally:
+            self._ghost_recovery_running = False
 
     async def _resolve_startup_trades(self) -> None:
         """Re-resolve trades that are still won=NULL after a bot restart."""
@@ -379,6 +407,8 @@ class PolyOracle:
             window_close_ts = float(window_ts + 300)
 
             actual_direction: str | None = None
+            resolution_method: str | None = None
+            close_price: float | None = None
 
             # 1. Try Polymarket oracle
             if not cfg.paper_mode and lane:
@@ -387,6 +417,8 @@ class PolyOracle:
                     if market:
                         async with PolymarketRestClient() as rest:
                             actual_direction = await rest.get_market_winner(market.condition_id)
+                    if actual_direction:
+                        resolution_method = "oracle"
                 except Exception as exc:
                     logger.warning(f"Startup resolution oracle check failed for {order_id}: {exc}")
 
@@ -395,8 +427,9 @@ class PolyOracle:
                 close_price = await get_window_close_price(binance_symbol, window_ts)
                 if open_price <= 0:
                     open_price = await get_window_open_price(binance_symbol, window_ts)
-                if close_price > 0 and open_price > 0:
+                if close_price and close_price > 0 and open_price > 0:
                     actual_direction = "UP" if close_price >= open_price else "DOWN"
+                    resolution_method = "binance"
                     logger.info(
                         f"Startup resolution Binance fallback {order_id}: "
                         f"open={open_price:.2f} close={close_price:.2f} → {actual_direction}"
@@ -410,9 +443,22 @@ class PolyOracle:
                 continue
 
             won = direction == actual_direction
-            pnl = (size_usd / entry_price - size_usd) if won else -size_usd
+            fee_usd = float(row.get("fee_usd") or 0)
+            db_filled_shares = float(row.get("filled_shares") or 0)
+            db_filled_price = float(row.get("filled_price") or 0) or entry_price
+            if db_filled_shares > 0:
+                # Use actual fill data persisted at fill time — correct for partial GTC fills.
+                actual_cost = round(db_filled_shares * db_filled_price, 2)
+                pnl = (db_filled_shares - actual_cost) if won else -(actual_cost + fee_usd)
+            else:
+                # Fallback: assume full fill at intended size (may be wrong for GTC).
+                pnl = (size_usd / entry_price - size_usd) if won else -size_usd
 
-            await trade_db.resolve_trade(order_id, won, actual_direction, pnl)
+            await trade_db.resolve_trade(
+                order_id, won, actual_direction, pnl,
+                close_price=close_price,
+                resolution_method=resolution_method,
+            )
 
             self._pnl.record_trade(
                 trade_id=order_id,
@@ -425,6 +471,8 @@ class PolyOracle:
                 closed_at=window_close_ts,
             )
 
+            _av = row.get("agent_votes")
+            _cb = row.get("confidence_breakdown")
             self._dashboard.push("trade_resolved", {
                 "order_id": order_id,
                 "market": market_slug,
@@ -436,7 +484,17 @@ class PolyOracle:
                 "window_ts": window_ts,
                 "confidence": round(confidence, 1),
                 "size_usd": round(size_usd, 2),
+                "fee_usd": float(row["fee_usd"]) if row.get("fee_usd") is not None else None,
                 "price": round(entry_price, 4),
+                "filled_shares": float(row["filled_shares"]) if row.get("filled_shares") else None,
+                "filled_price": float(row["filled_price"]) if row.get("filled_price") else None,
+                "close_price": round(close_price, 4) if close_price else None,
+                "price_move_pct": round((close_price - open_price) / open_price * 100, 4)
+                    if close_price and open_price and open_price > 0 else None,
+                "resolution_method": resolution_method,
+                "window_delta_pct": float(row["window_delta_pct"]) if row.get("window_delta_pct") is not None else None,
+                "agent_votes": json.loads(_av) if isinstance(_av, str) else _av,
+                "confidence_breakdown": json.loads(_cb) if isinstance(_cb, str) else _cb,
             })
             logger.info(
                 f"Startup resolution: {order_id} → {'WIN' if won else 'LOSS'} "
@@ -662,7 +720,7 @@ class PolyOracle:
             for order in cancelled_orders:
                 actual = _order_actual_cost(order)
                 refund = order.size_usd - actual
-                self._exposure.close_position(order.size_usd)
+                self._exposure.close_position(order.size_usd, symbol)
                 self._balance += refund + order.fee_usd
                 self._dashboard.push("trade_cancelled", {
                     "order_id": order.order_id,
@@ -725,7 +783,7 @@ class PolyOracle:
             return
 
         # Check exposure limits
-        can_open, reason = self._exposure.can_open_position(cfg.trade_amount_usd)
+        can_open, reason = self._exposure.can_open_position(cfg.trade_amount_usd, symbol)
         if not can_open:
             return
 
@@ -734,10 +792,27 @@ class PolyOracle:
         if agg.binance_price <= 0:
             logger.warning(f"{symbol} price unavailable (Binance feed down?) — skip trade")
             return
-        if agg.oracle_latency_sec > 300 and lane.config.chainlink_proxy:
+        stale_threshold = lane.config.chainlink_heartbeat_sec * 3
+        if agg.oracle_latency_sec > stale_threshold and lane.config.chainlink_proxy:
             logger.warning(
-                f"{symbol} Chainlink oracle stale: {agg.oracle_latency_sec:.0f}s since last update"
+                f"{symbol} Chainlink oracle stale: {agg.oracle_latency_sec:.0f}s "
+                f"(expected ≤{stale_threshold}s)"
             )
+
+        # Acquire per-lane lock to prevent two concurrent _maybe_trade_lane
+        # calls (e.g. _on_phase_change + _on_clock_tick firing simultaneously)
+        # from both passing the "no existing order" check before either has
+        # finished placing — which caused the double-fill bug.
+        if lane.trade_lock.locked():
+            return  # Another evaluation is in progress for this lane — skip
+        async with lane.trade_lock:
+            await self._maybe_trade_lane_locked(lane, window, is_deadline, breaker)
+
+    async def _maybe_trade_lane_locked(
+        self, lane, window: "WindowState", is_deadline: bool, breaker,
+    ) -> None:
+        """Inner body of _maybe_trade_lane, called with lane.trade_lock held."""
+        symbol = lane.config.symbol
 
         # Check for existing or already-attempted position in this window
         existing = lane.order_manager.get_active_for_window(window.window_ts)
@@ -770,6 +845,26 @@ class PolyOracle:
         if not decision.should_trade:
             if is_deadline:
                 logger.info(f"{symbol} deadline skip: {decision.reason}")
+            return
+
+        # ── Anti-herding gate ─────────────────────────────────────────────────
+        # When 2+ other lanes already have an active position for this window
+        # in the SAME direction, we're likely entering a crowded macro trade at
+        # the tail end of the move — historically these are our worst losses.
+        # Allow up to 2 correlated-direction trades per window; skip the 3rd+.
+        same_direction_count = sum(
+            1 for other_lane in self._lanes.values()
+            if other_lane is not lane
+            and any(
+                o.window_ts == window.window_ts and o.direction == decision.direction
+                for o in other_lane.order_manager.get_recent_history(5)
+            )
+        )
+        if same_direction_count >= 2:
+            logger.info(
+                f"{symbol} anti-herding skip: {same_direction_count} other lanes already "
+                f"{decision.direction} in this window — correlated entry risk too high"
+            )
             return
 
         # Resolve market
@@ -831,7 +926,7 @@ class PolyOracle:
             )
 
         if order:
-            self._exposure.open_position(order.size_usd)
+            self._exposure.open_position(order.size_usd, symbol)
             self._balance -= (order.size_usd + order.fee_usd)
             self._drawdown.update(self._balance)
             lane.last_trade_votes = (
@@ -840,6 +935,7 @@ class PolyOracle:
             )
 
             order_type_tag = "GTC" if use_gtc else "FOK"
+            order.order_type = order_type_tag
             consensus = lane.strategy.last_consensus
             votes_payload = consensus.to_dict()["votes"] if consensus else []
             conf_payload = decision.confidence.to_dict()
@@ -870,6 +966,12 @@ class PolyOracle:
                 f"(conf={order.confidence:.0f})"
                 + (" — awaiting fill" if is_live_gtc else "")
             )
+            self._order_meta[order.order_id] = {
+                "order_type": order_type_tag,
+                "agent_votes": votes_payload,
+                "confidence_breakdown": conf_payload,
+                "window_delta_pct": round(lane_delta, 4),
+            }
             asyncio.create_task(trade_db.record_trade(
                 order_id=order.order_id,
                 asset=symbol,
@@ -880,6 +982,8 @@ class PolyOracle:
                 confidence=order.confidence,
                 window_ts=order.window_ts,
                 order_type=order_type_tag,
+                fee_usd=order.fee_usd,
+                entry_sec_remaining=round(window.remaining_sec, 1),
                 window_delta_pct=round(lane_delta, 4),
                 open_price=lane.strategy.window_open_price or None,
                 agent_votes=votes_payload,
@@ -899,7 +1003,15 @@ class PolyOracle:
                 for order_id in filled:
                     for order in lane.order_manager.get_recent_history(50):
                         if order.order_id == order_id:
-                            self._exposure.close_position(order.size_usd)
+                            self._exposure.close_position(order.size_usd, symbol)
+                            # Persist fill data immediately so startup re-resolution
+                            # can compute correct pnl if the bot restarts before window close.
+                            if order.filled_shares > 0 and (order.filled_price or order.price) > 0:
+                                asyncio.create_task(trade_db.update_trade_fill(
+                                    order_id,
+                                    order.filled_shares,
+                                    order.filled_price or order.price,
+                                ))
                             self._dashboard.push("trade_executed", {
                                 "order_id": order.order_id,
                                 "market": order.market_slug,
@@ -922,7 +1034,7 @@ class PolyOracle:
                 for order_id in cancelled:
                     for order in lane.order_manager.get_recent_history(50):
                         if order.order_id == order_id:
-                            self._exposure.close_position(order.size_usd)
+                            self._exposure.close_position(order.size_usd, symbol)
                             self._balance += order.size_usd + order.fee_usd
                             self._dashboard.push("trade_cancelled", {
                                 "order_id": order_id,
@@ -953,12 +1065,13 @@ class PolyOracle:
             close_price = lane.aggregator.current_price
             logger.warning(f"{symbol} kline close unavailable — using live snapshot for fallback")
 
-        actual_direction = await self._determine_resolution_for_lane(lane, window, open_at_close)
+        actual_direction, resolution_method = await self._determine_resolution_for_lane(lane, window, open_at_close)
 
         if actual_direction is None:
             # Fallback: use close-time price (captured at T+15s) vs window open.
             if open_at_close > 0 and close_price > 0:
                 actual_direction = "UP" if close_price >= open_at_close else "DOWN"
+                resolution_method = "binance"
                 logger.warning(
                     f"{symbol} resolution fallback to Binance close price: "
                     f"open={open_at_close:.2f} close={close_price:.2f} → {actual_direction}"
@@ -975,7 +1088,7 @@ class PolyOracle:
                             "order_id": order.order_id,
                             "asset": symbol,
                         })
-                        self._exposure.close_position(order.size_usd)
+                        self._exposure.close_position(order.size_usd, symbol)
                 return
 
         logger.info(f"{symbol} resolution: {window.window_slug} → {actual_direction}")
@@ -991,18 +1104,35 @@ class PolyOracle:
                 OrderStatus.CANCELLED, OrderStatus.REJECTED,
                 OrderStatus.EXPIRED, OrderStatus.PENDING,
             ):
+                self._order_meta.pop(order.order_id, None)
                 self._dashboard.push("trade_cancelled", {
                     "order_id": order.order_id,
                     "asset": symbol,
                 })
                 continue
 
+            # For GTC orders, refresh fill from CLOB before computing P&L — the initial
+            # poll may have captured only the first partial match while more filled later.
+            if order.order_type == "GTC" and lane.executor and not cfg.paper_mode:
+                refreshed = await lane.executor.refresh_gtc_fill(order)
+                if refreshed and order.filled_shares > 0:
+                    asyncio.create_task(trade_db.update_trade_fill(
+                        order.order_id,
+                        order.filled_shares,
+                        order.filled_price or order.price,
+                    ))
+
             won = order.direction == actual_direction
             actual_cost = _order_actual_cost(order)
+            # Scale fee proportionally to actual fill (partial fills cost less in fees).
+            proportional_fee = (
+                round(order.fee_usd * (actual_cost / order.size_usd), 4)
+                if order.size_usd > 0 else order.fee_usd
+            )
             pnl = (
                 (order.filled_shares - actual_cost)
                 if won
-                else -(actual_cost + order.fee_usd)
+                else -(actual_cost + proportional_fee)
             )
 
             lane.claimer.schedule_claim(order, actual_direction)
@@ -1016,25 +1146,36 @@ class PolyOracle:
                 window_ts=order.window_ts,
             )
 
+            is_partial = actual_cost < order.size_usd - 0.01
+            fill_label = f"fill=${actual_cost:.2f}{' (partial)' if is_partial else ''}"
+            # GTC fills can accumulate beyond what was polled; true P&L set by claimer.
+            pnl_label = f"~${pnl:.2f} (prelim)" if is_partial else f"${pnl:.2f}"
             if won:
                 self._balance += order.size_shares
                 self._dashboard.push_log(
                     "TRADE", "resolution",
-                    f"WIN +${pnl:.2f} | {symbol} {order.direction} | "
-                    f"size=${order.size_usd:.2f} | conf={order.confidence:.0f}"
+                    f"WIN +{pnl_label} | {symbol} {order.direction} | "
+                    f"{fill_label} | conf={order.confidence:.0f}"
                 )
             else:
                 self._dashboard.push_log(
                     "TRADE", "resolution",
-                    f"LOSS -${abs(pnl):.2f} | {symbol} {order.direction} | "
-                    f"size=${order.size_usd:.2f} | conf={order.confidence:.0f}"
+                    f"LOSS -{pnl_label} | {symbol} {order.direction} | "
+                    f"{fill_label} | conf={order.confidence:.0f}"
                 )
-            self._exposure.close_position(_order_actual_cost(order))
+            self._exposure.close_position(actual_cost, symbol)
 
             lane_delta = (
                 (close_price - open_at_close) / open_at_close * 100
                 if open_at_close > 0 else 0.0
             )
+            price_move_pct = (
+                round((close_price - open_at_close) / open_at_close * 100, 4)
+                if open_at_close > 0 and close_price > 0 else None
+            )
+
+            meta = self._order_meta.pop(order.order_id, {})
+
             self._dashboard.push("trade_resolved", {
                 "order_id": order.order_id,
                 "market": order.market_slug,
@@ -1046,14 +1187,28 @@ class PolyOracle:
                 "window_ts": window.window_ts,
                 "price": order.price,
                 "size_usd": order.size_usd,
+                "fee_usd": order.fee_usd,
                 "confidence": round(order.confidence, 1),
-                "window_delta_pct": round(lane_delta, 4),
+                "order_type": meta.get("order_type") or order.order_type,
+                "window_delta_pct": meta.get("window_delta_pct", round(lane_delta, 4)),
+                "agent_votes": meta.get("agent_votes"),
+                "confidence_breakdown": meta.get("confidence_breakdown"),
+                "filled_shares": order.filled_shares or None,
+                "filled_price": order.filled_price or None,
+                "close_price": close_price if close_price > 0 else None,
+                "price_move_pct": price_move_pct,
+                "resolution_method": resolution_method,
             })
             asyncio.create_task(trade_db.resolve_trade(
                 order_id=order.order_id,
                 won=won,
                 actual_direction=actual_direction,
                 pnl=round(pnl, 2),
+                filled_shares=order.filled_shares or None,
+                filled_price=order.filled_price or None,
+                close_price=close_price if close_price > 0 else None,
+                price_move_pct=price_move_pct,
+                resolution_method=resolution_method,
             ))
 
         # Update portfolio stats
@@ -1077,7 +1232,7 @@ class PolyOracle:
         lane: AssetLane,
         window: WindowState,
         open_at_close: float,
-    ) -> str | None:
+    ) -> tuple[str | None, str]:
         """
         Determine the actual outcome of a window for one asset.
 
@@ -1091,6 +1246,8 @@ class PolyOracle:
             market = await lane.token_resolver.resolve_window(window.window_ts)
             if market:
                 async with PolymarketRestClient() as rest:
+                    # Check oracle first — may already be settled at window close.
+                    clob_404 = False
                     for attempt in range(10):
                         try:
                             result = await rest.get_market_winner(market.condition_id)
@@ -1099,64 +1256,87 @@ class PolyOracle:
                                     f"{symbol} live resolution: winner={result} "
                                     f"(attempt {attempt + 1})"
                                 )
-                                return result
-                            if attempt < 9:
-                                await asyncio.sleep(30)
+                                return result, "oracle"
                         except Exception as exc:
                             logger.warning(f"{symbol} resolution poll failed: {exc}")
-                            if attempt < 9:
-                                await asyncio.sleep(30)
 
-                    # Oracle not settled after 5 min — try CLOB mid-price.
-                    clob_404 = False
-                    try:
-                        book = await rest.get_order_book(market.yes_token_id)
-                        bids = book.get("bids", [])
-                        asks = book.get("asks", [])
-                        if bids and asks:
-                            best_bid = max(float(b["price"]) for b in bids)
-                            best_ask = min(float(a["price"]) for a in asks)
-                            mid = (best_bid + best_ask) / 2.0
-                            if mid > 0.90:
-                                logger.info(f"{symbol} CLOB mid={mid:.3f} → UP (settled high)")
-                                return "UP"
-                            if mid < 0.10:
-                                logger.info(f"{symbol} CLOB mid={mid:.3f} → DOWN (settled low)")
-                                return "DOWN"
-                            logger.info(
-                                f"{symbol} CLOB mid={mid:.3f} ambiguous after 5 min "
-                                f"— falling back to Binance price"
-                            )
-                    except aiohttp.ClientResponseError as exc:
-                        if exc.status == 404:
-                            clob_404 = True
-                            logger.info(f"{symbol} CLOB book 404 — market likely just resolved, retrying")
-                        else:
+                        # After the first oracle miss, check CLOB immediately.
+                        # If it's already 404, the market is closed and we should
+                        # skip the remaining oracle wait and go straight to fast polling.
+                        if attempt == 0:
+                            try:
+                                book = await rest.get_order_book(market.yes_token_id)
+                                bids = book.get("bids", [])
+                                asks = book.get("asks", [])
+                                if bids and asks:
+                                    best_bid = max(float(b["price"]) for b in bids)
+                                    best_ask = min(float(a["price"]) for a in asks)
+                                    mid = (best_bid + best_ask) / 2.0
+                                    if mid > 0.90:
+                                        logger.info(f"{symbol} CLOB mid={mid:.3f} → UP (settled high)")
+                                        return "UP", "clob"
+                                    if mid < 0.10:
+                                        logger.info(f"{symbol} CLOB mid={mid:.3f} → DOWN (settled low)")
+                                        return "DOWN", "clob"
+                            except aiohttp.ClientResponseError as exc:
+                                if exc.status == 404:
+                                    clob_404 = True
+                                    logger.info(f"{symbol} CLOB 404 at window close — oracle settling, fast-polling")
+                                    break  # Skip remaining oracle attempts; go to fast-poll below
+                            except Exception:
+                                pass
+
+                        if attempt < 9:
+                            await asyncio.sleep(10)
+
+                    # CLOB 404 path: market is closed, poll oracle at 10s until settled.
+                    if not clob_404:
+                        # Oracle still not settled after initial loop — check CLOB now.
+                        try:
+                            book = await rest.get_order_book(market.yes_token_id)
+                            bids = book.get("bids", [])
+                            asks = book.get("asks", [])
+                            if bids and asks:
+                                best_bid = max(float(b["price"]) for b in bids)
+                                best_ask = min(float(a["price"]) for a in asks)
+                                mid = (best_bid + best_ask) / 2.0
+                                if mid > 0.90:
+                                    logger.info(f"{symbol} CLOB mid={mid:.3f} → UP (settled high)")
+                                    return "UP", "clob"
+                                if mid < 0.10:
+                                    logger.info(f"{symbol} CLOB mid={mid:.3f} → DOWN (settled low)")
+                                    return "DOWN", "clob"
+                                logger.info(f"{symbol} CLOB mid={mid:.3f} ambiguous — falling back to Binance")
+                        except aiohttp.ClientResponseError as exc:
+                            if exc.status == 404:
+                                clob_404 = True
+                                logger.info(f"{symbol} CLOB book 404 — market resolved, fast-polling oracle")
+                            else:
+                                logger.warning(f"{symbol} CLOB mid-price check failed: {exc}")
+                        except Exception as exc:
                             logger.warning(f"{symbol} CLOB mid-price check failed: {exc}")
-                    except Exception as exc:
-                        logger.warning(f"{symbol} CLOB mid-price check failed: {exc}")
 
                     if clob_404:
-                        for retry in range(20):
+                        for retry in range(30):
                             try:
                                 result = await rest.get_market_winner(market.condition_id)
                                 if result:
                                     logger.info(f"{symbol} winner confirmed after CLOB 404: {result} (retry {retry + 1})")
-                                    return result
+                                    return result, "oracle"
                             except Exception as exc:
                                 logger.warning(f"{symbol} winner retry {retry + 1} failed: {exc}")
-                            await asyncio.sleep(30)
+                            await asyncio.sleep(10)
 
             logger.warning(f"{symbol}: all winner polls exhausted — returning None for close-price fallback")
-            return None
+            return None, "binance"
 
         # ── Paper mode: resolve from current Binance price ────────────────
         if open_at_close <= 0:
-            return None
+            return None, "paper"
         current = lane.aggregator.current_price
         if current <= 0:
-            return None
-        return "UP" if current >= open_at_close else "DOWN"
+            return None, "paper"
+        return ("UP" if current >= open_at_close else "DOWN"), "paper"
 
     # ── Market subscription ───────────────────────────────────────────────────
 
@@ -1182,15 +1362,19 @@ class PolyOracle:
 
             # Reconcile exposure counter against ground-truth order state.
             all_open = []
-            for lane in self._lanes.values():
-                all_open.extend(lane.order_manager.get_active_orders())
-                all_open.extend(
+            symbol_counts: dict[str, int] = {}
+            for sym, lane in self._lanes.items():
+                lane_open = list(lane.order_manager.get_active_orders())
+                lane_open += [
                     o for o in lane.order_manager.get_recent_history(200)
                     if o.status == OrderStatus.FILLED and o.pnl is None
-                )
+                ]
+                all_open.extend(lane_open)
+                symbol_counts[sym] = len(lane_open)
             self._exposure.reconcile(
                 true_count=len(all_open),
                 true_usd=sum(_order_actual_cost(o) for o in all_open),
+                symbol_counts=symbol_counts,
             )
 
             # Update balance from chain if live

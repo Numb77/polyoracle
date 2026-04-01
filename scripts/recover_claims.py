@@ -6,9 +6,10 @@ checks each one is resolved on-chain (payoutDenominator > 0), then calls
 redeemPositions on the Gnosis ConditionalTokens contract to collect USDC.
 
 Usage:
-    python scripts/recover_claims.py [--dry-run]
+    python scripts/recover_claims.py [--dry-run] [--speed-up]
 
-    --dry-run   Show what would be claimed without sending any transactions.
+    --dry-run    Show what would be claimed without sending any transactions.
+    --speed-up   Replace any stuck mempool tx with a 50% gas bump, then claim.
 """
 
 from __future__ import annotations
@@ -87,7 +88,50 @@ async def fetch_positions(wallet_address: str) -> list[dict]:
     return positions
 
 
-async def recover_all(dry_run: bool = False) -> None:
+async def speed_up_stuck_tx(w3, wallet, confirmed: int, pending: int) -> bool:
+    """
+    Replace stuck mempool txs by sending a 0-MATIC self-transfer with the same
+    nonce(s) but 50% higher gas.  Returns True once all stuck nonces are cleared.
+    """
+    from web3 import Web3
+    logger.info(f"Attempting to speed up {pending - confirmed} stuck tx(s)...")
+    for nonce in range(confirmed, pending):
+        try:
+            current_gas = await w3.eth.gas_price
+            bump_gas = int(current_gas * 1.5)
+            tx = {
+                "from": wallet.address,
+                "to": wallet.address,
+                "value": 0,
+                "nonce": nonce,
+                "gasPrice": bump_gas,
+                "gas": 21_000,
+                "chainId": 137,
+            }
+            signed = w3.eth.account.sign_transaction(tx, cfg.normalized_private_key)
+            tx_hash = await w3.eth.send_raw_transaction(signed.raw_transaction)
+            logger.info(f"  Speed-up tx submitted for nonce {nonce}: {tx_hash.hex()[:20]}...")
+        except Exception as exc:
+            exc_s = str(exc).lower()
+            if "nonce too low" in exc_s or "already known" in exc_s:
+                logger.info(f"  Nonce {nonce} already confirmed — skipping")
+            else:
+                logger.warning(f"  Speed-up for nonce {nonce} failed: {exc}")
+
+    # Wait up to 3 min for the replacements to confirm
+    logger.info("Waiting for speed-up tx(s) to confirm (max 3 min)...")
+    for i in range(18):
+        await asyncio.sleep(10.0)
+        new_confirmed = await w3.eth.get_transaction_count(wallet.address, 'latest')
+        if new_confirmed >= pending:
+            logger.info(f"All stuck tx(s) cleared — nonce now {new_confirmed}")
+            return True
+        logger.info(f"  Still waiting ({(i+1)*10}s): confirmed={new_confirmed}, pending={pending}")
+    logger.error("Speed-up txs not confirmed after 3 min — try again or wait longer")
+    return False
+
+
+async def recover_all(dry_run: bool = False, speed_up: bool = False) -> None:
     if not cfg.has_wallet():
         logger.error("No PRIVATE_KEY configured in .env — cannot sign transactions")
         return
@@ -114,6 +158,35 @@ async def recover_all(dry_run: bool = False) -> None:
         address=Web3.to_checksum_address(USDC_ADDRESS),
         abi=USDC_ABI,
     )
+
+    # ── Wait for any stuck mempool txs to confirm ────────────────────────────
+    # Dry-run doesn't submit any transactions, so skip the mempool check.
+    confirmed = await w3.eth.get_transaction_count(wallet.address, 'latest')
+    pending = await w3.eth.get_transaction_count(wallet.address, 'pending')
+    if not dry_run and pending > confirmed:
+        count = pending - confirmed
+        logger.warning(
+            f"Detected {count} stuck tx(s) in mempool (nonces {confirmed}–{pending-1})."
+        )
+        if speed_up:
+            cleared = await speed_up_stuck_tx(w3, wallet, confirmed, pending)
+        else:
+            logger.warning(
+                "Waiting for them to confirm (max 5 min). "
+                "Run with --speed-up to replace them immediately."
+            )
+            cleared = False
+            for i in range(30):  # 30 × 10s = 5 min
+                await asyncio.sleep(10.0)
+                new_confirmed = await w3.eth.get_transaction_count(wallet.address, 'latest')
+                if new_confirmed >= pending:
+                    logger.info(f"Stuck tx(s) confirmed — nonce now {new_confirmed}. Proceeding.")
+                    cleared = True
+                    break
+                logger.info(f"  Still waiting ({(i+1)*10}s): confirmed={new_confirmed}, pending={pending}")
+        if not cleared:
+            logger.error("Stuck txs still pending — aborting. Try again later.")
+            return
 
     # ── Fetch positions ───────────────────────────────────────────────────────
     logger.info("Fetching unclaimed positions from Polymarket data API...")
@@ -190,9 +263,23 @@ async def recover_all(dry_run: bool = False) -> None:
         try:
             balance_before = await usdc.functions.balanceOf(wallet.address).call()
 
-            nonce = await w3.eth.get_transaction_count(wallet.address)
-            gas_price = await w3.eth.gas_price
-            gas_price = int(gas_price * 1.1)  # +10% tip
+            # Wait for any in-flight tx from a previous claim to confirm.
+            # The RPC enforces a 1-tx-in-flight limit, so we must confirm
+            # each claim before submitting the next.
+            for attempt in range(60):  # up to 5 min (60 × 5s)
+                cur_confirmed = await w3.eth.get_transaction_count(wallet.address, 'latest')
+                cur_pending = await w3.eth.get_transaction_count(wallet.address, 'pending')
+                if cur_pending <= cur_confirmed:
+                    break
+                if attempt == 0:
+                    logger.info(f"  Waiting for previous tx to confirm (nonce {cur_confirmed}→{cur_pending-1})...")
+                await asyncio.sleep(5.0)
+            else:
+                logger.error("  Previous tx still unconfirmed after 5 min — skipping this claim")
+                continue
+
+            nonce = await w3.eth.get_transaction_count(wallet.address, 'pending')
+            gas_price = int((await w3.eth.gas_price) * 1.2)
 
             tx = await ctf.functions.redeemPositions(
                 Web3.to_checksum_address(USDC_ADDRESS),
@@ -210,7 +297,7 @@ async def recover_all(dry_run: bool = False) -> None:
             tx_hash = await w3.eth.send_raw_transaction(signed.raw_transaction)
 
             logger.info(f"  Tx submitted: {tx_hash.hex()}")
-            receipt = await w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+            receipt = await w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
 
             if receipt["status"] != 1:
                 logger.warning(f"  Tx REVERTED — condition may not be fully settled yet")
@@ -231,9 +318,6 @@ async def recover_all(dry_run: bool = False) -> None:
                     f"(tx={tx_hash.hex()[:20]}...)"
                 )
 
-            # Brief pause to avoid nonce conflicts on rapid successive txs
-            await asyncio.sleep(2.0)
-
         except Exception as exc:
             logger.error(f"  Transaction failed: {type(exc).__name__}: {exc}")
             await asyncio.sleep(3.0)
@@ -251,12 +335,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Recover unclaimed Polymarket positions")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show positions without sending transactions")
+    parser.add_argument("--speed-up", action="store_true",
+                        help="Replace stuck mempool txs with 50%% higher gas, then claim")
     args = parser.parse_args()
 
     if args.dry_run:
         logger.info("DRY RUN MODE — no transactions will be sent")
 
-    asyncio.run(recover_all(dry_run=args.dry_run))
+    asyncio.run(recover_all(dry_run=args.dry_run, speed_up=args.speed_up))
 
 
 if __name__ == "__main__":

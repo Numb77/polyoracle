@@ -47,6 +47,7 @@ class Order:
     filled_at: float | None = None
     window_ts: int = 0
     is_paper: bool = False
+    order_type: str = ""   # 'GTC' or 'FOK' — set by main after execution
 
     @property
     def is_active(self) -> bool:

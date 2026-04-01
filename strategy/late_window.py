@@ -38,12 +38,14 @@ class LateWindowStrategy(BaseStrategy):
         poly_ws: PolymarketWebSocket,
         oracle: ChainlinkOracle,
         consensus_engine: ConsensusEngine,
+        min_delta_pct: float = 0.08,
     ) -> None:
         self._candles = candle_builder
         self._aggregator = aggregator
         self._poly_ws = poly_ws
         self._oracle = oracle
         self._consensus = consensus_engine
+        self._min_delta_pct = min_delta_pct
 
         self._signal_combiner = SignalCombiner()
         self._confidence_engine = ConfidenceEngine()
@@ -121,17 +123,21 @@ class LateWindowStrategy(BaseStrategy):
         # Reference ATR: 0.03% per 1-min candle = "typical" BTC micro-move.
         # We allow the threshold to shrink in quiet markets (down to 0.5× base)
         # and grow in volatile markets (up to 2.5× base) to filter noise.
+        # Per-asset base minimum, vol-scaled.
+        # SOL/XRP use higher bases (0.12%/0.09%) than BTC/ETH (0.08%/0.07%)
+        # because smaller-cap assets are noisier — the same absolute delta is
+        # a weaker signal on a more volatile coin.
         REF_ATR = 0.03
         if len(df_1m) >= 14:
             current_atr = compute_atr(df_1m, period=14)
             if current_atr > 0:
                 vol_scale = max(0.5, min(2.5, current_atr / REF_ATR))
-                dynamic_min_delta = cfg.min_window_delta_pct * vol_scale
+                dynamic_min_delta = self._min_delta_pct * vol_scale
             else:
-                dynamic_min_delta = cfg.min_window_delta_pct
+                dynamic_min_delta = self._min_delta_pct
         else:
             current_atr = 0.0
-            dynamic_min_delta = cfg.min_window_delta_pct
+            dynamic_min_delta = self._min_delta_pct
 
         if abs(window_delta_pct) < dynamic_min_delta:
             return self._no_trade(
@@ -223,22 +229,48 @@ class LateWindowStrategy(BaseStrategy):
         # If a non-muted agent with accuracy > 70% is voting AGAINST our direction
         # with conviction > 0.60, that is a high-quality warning from an agent
         # that has earned its credibility. Skip the trade.
-        # Exception: if window delta is very strong (≥ 0.20%), momentum usually wins.
-        if abs(window_delta_pct) < 0.20:
-            from agents.agent_base import Vote as _Vote
-            our_vote = _Vote.UP if window_direction == "UP" else _Vote.DOWN
-            for v in consensus.votes:
-                if (
-                    not v.is_muted
-                    and v.vote not in (our_vote, _Vote.ABSTAIN)
-                    and v.accuracy >= 0.70
-                    and v.conviction >= 0.60
-                ):
-                    return self._no_trade(
-                        f"High-accuracy dissent: {v.agent_name} "
-                        f"({v.accuracy:.0%} acc) voted {v.vote.value} "
-                        f"vs our {window_direction} with {v.conviction:.2f} conviction — skip"
-                    )
+        from agents.agent_base import Vote as _Vote
+        our_vote = _Vote.UP if window_direction == "UP" else _Vote.DOWN
+        for v in consensus.votes:
+            if (
+                not v.is_muted
+                and v.vote not in (our_vote, _Vote.ABSTAIN)
+                and v.accuracy >= 0.70
+                and v.conviction >= 0.60
+            ):
+                return self._no_trade(
+                    f"High-accuracy dissent: {v.agent_name} "
+                    f"({v.accuracy:.0%} acc) voted {v.vote.value} "
+                    f"vs our {window_direction} with {v.conviction:.2f} conviction — skip"
+                )
+
+        # ── 5d. Multi-agent dissent gate ──────────────────────────────────────
+        # When 2+ non-muted agents actively oppose our direction with meaningful
+        # conviction, the signal is genuinely contested regardless of their
+        # individual historical accuracy. Two independent analytical lenses
+        # disagreeing is a reliable regime-level warning.
+        opposing_votes = [
+            v for v in consensus.votes
+            if not v.is_muted
+            and v.vote not in (our_vote, _Vote.ABSTAIN)
+            and v.conviction >= 0.50
+        ]
+        if len(opposing_votes) >= 2:
+            avg_opp = sum(v.conviction for v in opposing_votes) / len(opposing_votes)
+            names = ", ".join(v.agent_name for v in opposing_votes)
+            return self._no_trade(
+                f"Multi-agent dissent: {names} oppose {window_direction} "
+                f"(avg conviction={avg_opp:.2f}) — signal too contested"
+            )
+
+        # ── 5e. Max opposing conviction (for confidence penalty) ──────────────
+        # Even with only one opposing agent, high raw conviction signals local
+        # conditions (RSI extreme, heavy order book pressure) that deserve weight.
+        max_opposing_conviction = max(
+            (v.conviction for v in consensus.votes
+             if not v.is_muted and v.vote not in (our_vote, _Vote.ABSTAIN)),
+            default=0.0,
+        )
 
         # ── 6. Confidence score ──────────────────────────────────────────────
         # Cross-asset alignment: +1 = other asset confirms direction,
@@ -259,6 +291,7 @@ class LateWindowStrategy(BaseStrategy):
             polymarket_alignment=polymarket_alignment,
             elapsed_sec=max(0.0, 300.0 - window.remaining_sec),
             cross_asset_alignment=cross_asset_alignment,
+            opposing_conviction=max_opposing_conviction,
         )
 
         # ── 7. Direction: always follow window delta ─────────────────────────

@@ -77,18 +77,30 @@ class OrderFlowAgent(BaseAgent):
             conviction = abs_imbalance / self.STRONG_IMBALANCE * 0.6
             strength_label = "moderate"
 
-        # Order book is a CONFIRMING signal only — not a contrarian one.
-        # When the book leans against the current window delta, the order book
-        # is just reflecting passive market-maker liquidity replenishment, not
-        # informed directional flow. Abstain rather than fight the delta.
         delta_dir = "UP" if window_delta_pct > 0 else "DOWN" if window_delta_pct < 0 else "NEUTRAL"
         if delta_dir != "NEUTRAL" and delta_dir != vote.value:
+            # Book opposes the window delta.
+            # A STRONG opposing book means Polymarket participants are actively
+            # positioning against the current price move — genuine contra-signal.
+            # A weak opposition is ambiguous (market-maker replenishment) — abstain.
+            if abs_imbalance >= self.STRONG_IMBALANCE:
+                contra_vote = Vote.DOWN if vote == Vote.UP else Vote.UP
+                contra_conviction = min(conviction * 0.55, 0.55)
+                return AgentVote(
+                    agent_name=self.name,
+                    vote=contra_vote,
+                    conviction=contra_conviction,
+                    reasoning=(
+                        f"Book strongly {vote.value} ({ob_imbalance:+.3f}) vs "
+                        f"delta={window_delta_pct:+.3f}% — smart money contra-signal"
+                    ),
+                )
             return AgentVote(
                 agent_name=self.name,
                 vote=Vote.ABSTAIN,
                 conviction=0.0,
                 reasoning=(
-                    f"Book {vote.value} conflicts with delta={window_delta_pct:+.3f}% — abstain"
+                    f"Book {vote.value} weakly conflicts with delta={window_delta_pct:+.3f}% — abstain"
                 ),
             )
 

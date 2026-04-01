@@ -809,7 +809,10 @@ class PolymarketExecutor:
                     size_matched_poll = float(raw_matched) if raw_matched else 0.0
 
                     if order_status == "MATCHED":
-                        size_matched = float(status.get("size_matched", order.size_shares))
+                        # Use size_matched_poll (already parsed above) rather than
+                        # falling back to order.size_shares — an absent size_matched
+                        # field should not silently record the full intended quantity.
+                        size_matched = size_matched_poll if size_matched_poll > 0 else order.size_shares
                         self._orders.mark_filled(order.order_id, size_matched, filled_price)
                         logger.trade(  # type: ignore[attr-defined]
                             f"[GTC FILLED] {order.direction} {order.outcome} "
@@ -836,9 +839,14 @@ class PolymarketExecutor:
                         # ── Dynamic repricing ──────────────────────────────────────
                         # If the best ask has moved since we placed the order,
                         # cancel and re-place at the new price so we stay competitive.
-                        was_cancelled = await self._reprice_gtc_if_needed(order, client)
-                        if was_cancelled:
+                        # Returns True=cancelled, None=fill detected mid-reprice, False=no action.
+                        reprice_result = await self._reprice_gtc_if_needed(order, client)
+                        if reprice_result is True:
                             newly_cancelled.append(order.order_id)
+                        elif reprice_result is None:
+                            # Fill raced between the poll and the pre-cancel check.
+                            # Treat as a normal fill so the caller records it.
+                            newly_filled.append(order.order_id)
                 except Exception as exc:
                     logger.debug(f"Fill poll failed for {order.order_id[:12]}...: {exc}")
 
@@ -849,7 +857,42 @@ class PolymarketExecutor:
 
         return newly_filled, newly_cancelled
 
-    async def _reprice_gtc_if_needed(self, order, client) -> bool:
+    async def refresh_gtc_fill(self, order) -> bool:
+        """
+        Re-query the CLOB for the latest fill on a GTC order and update the Order
+        object in-place.  Call this at window close before computing P&L so that
+        fills accumulated after the initial poll are captured.
+
+        Returns True if the fill data changed, False if unchanged or unavailable.
+        """
+        if self._is_paper or not order.order_id:
+            return False
+        try:
+            client = self._get_clob_client()
+            if client is None:
+                return False
+            loop = asyncio.get_event_loop()
+            status = await loop.run_in_executor(None, client.get_order, order.order_id)
+            if not status:
+                return False
+            raw = status.get("size_matched") or status.get("sizeMatched") or "0"
+            latest_shares = float(raw) if raw else 0.0
+            if latest_shares <= 0:
+                return False
+            latest_price = float(status.get("price", order.filled_price or order.price))
+            if abs(latest_shares - order.filled_shares) < 0.001:
+                return False  # No change
+            logger.debug(
+                f"GTC fill refresh {order.order_id[:12]}...: "
+                f"{order.filled_shares:.4f} → {latest_shares:.4f} shares @ {latest_price:.4f}"
+            )
+            self._orders.mark_filled(order.order_id, latest_shares, latest_price)
+            return True
+        except Exception as exc:
+            logger.debug(f"refresh_gtc_fill {order.order_id[:12]}...: {exc}")
+            return False
+
+    async def _reprice_gtc_if_needed(self, order, client) -> bool | None:
         """
         Cancel and re-place a GTC order if the ask has moved enough to warrant
         a better bid price.  Keeps the order competitive without human intervention.
@@ -888,14 +931,14 @@ class PolymarketExecutor:
                 )
                 pre_matched = float(raw) if raw else 0.0
                 if pre_matched > 0:
-                    # Already partially (or fully) filled — accept, no reprice
+                    # Fill raced between poll and cancel — accept it, no reprice.
                     fp = float(pre_cancel_status.get("price", order.price))
                     self._orders.mark_filled(order.order_id, pre_matched, fp)
                     logger.info(
                         f"GTC {order.order_id[:12]}... pre-cancel fill detected "
                         f"({pre_matched:.1f} shares @ {fp:.3f}) — skip reprice"
                     )
-                    return False
+                    return None  # Signals caller to add to newly_filled
 
             # Fetch current ask directly via REST order book
             book = await loop.run_in_executor(
@@ -999,7 +1042,9 @@ class PolymarketExecutor:
                         if status and status.get("status") == "MATCHED":
                             # Filled — record and skip cancel; caller handles exposure via resolution
                             filled_price = float(status.get("price", order.price))
-                            size_matched = float(status.get("size_matched", order.size_shares))
+                            raw_sm = status.get("size_matched") or status.get("sizeMatched") or "0"
+                            size_matched_val = float(raw_sm) if raw_sm else 0.0
+                            size_matched = size_matched_val if size_matched_val > 0 else order.size_shares
                             self._orders.mark_filled(
                                 order.order_id, size_matched, filled_price
                             )

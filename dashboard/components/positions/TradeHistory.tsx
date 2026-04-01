@@ -189,10 +189,58 @@ function TradeDetailModal({
 								<div className="text-white">{trade.price.toFixed(3)}</div>
 							</div>
 						)}
+						{trade.filled_price != null && trade.filled_price !== trade.price && (
+							<div className="bg-zinc-900 rounded p-2">
+								<div className="text-zinc-500 mb-0.5">FILL PRICE</div>
+								<div className={cn(
+									"font-bold",
+									trade.filled_price > (trade.price ?? 0) ? "text-accent-red" : "text-accent-green",
+								)}>
+									{trade.filled_price.toFixed(3)}
+									<span className="text-zinc-500 font-normal ml-1 text-[10px]">
+										({trade.filled_price > (trade.price ?? 0) ? "+" : ""}
+										{((trade.filled_price - (trade.price ?? 0)) * 100).toFixed(1)}¢ slip)
+									</span>
+								</div>
+							</div>
+						)}
 						{trade.size_usd != null && (
 							<div className="bg-zinc-900 rounded p-2">
-								<div className="text-zinc-500 mb-0.5">SIZE</div>
+								<div className="text-zinc-500 mb-0.5">SIZE (INTENDED)</div>
 								<div className="text-white">${trade.size_usd.toFixed(2)}</div>
+							</div>
+						)}
+						{trade.filled_shares != null && trade.price != null && (
+							<div className="bg-zinc-900 rounded p-2">
+								<div className="text-zinc-500 mb-0.5">FILLED (ACTUAL COST)</div>
+								<div className={cn(
+									"font-bold",
+									trade.filled_shares * trade.price < (trade.size_usd ?? 0) * 0.99
+										? "text-yellow-400"
+										: "text-white",
+								)}>
+									${(trade.filled_shares * (trade.filled_price ?? trade.price)).toFixed(2)}
+									{trade.filled_shares * trade.price < (trade.size_usd ?? 0) * 0.99 && (
+										<span className="text-zinc-500 font-normal ml-1 text-[10px]">partial fill</span>
+									)}
+								</div>
+							</div>
+						)}
+						{trade.fee_usd != null && (
+							<div className="bg-zinc-900 rounded p-2">
+								<div className="text-zinc-500 mb-0.5">FEE PAID</div>
+								<div className="text-zinc-300">
+									{trade.fee_usd === 0
+										? <span className="text-zinc-500">$0.00 <span className="text-[10px]">(maker)</span></span>
+										: `$${trade.fee_usd.toFixed(2)}`
+									}
+								</div>
+							</div>
+						)}
+						{trade.filled_shares != null && (
+							<div className="bg-zinc-900 rounded p-2">
+								<div className="text-zinc-500 mb-0.5">SHARES</div>
+								<div className="text-white">{trade.filled_shares.toFixed(2)}</div>
 							</div>
 						)}
 						<div className="bg-zinc-900 rounded p-2">
@@ -203,7 +251,7 @@ function TradeDetailModal({
 						</div>
 						{trade.window_delta_pct != null && (
 							<div className="bg-zinc-900 rounded p-2">
-								<div className="text-zinc-500 mb-0.5">ΔBTC AT ENTRY</div>
+								<div className="text-zinc-500 mb-0.5">Δ AT ENTRY</div>
 								<div
 									className={cn(
 										"font-bold",
@@ -217,12 +265,46 @@ function TradeDetailModal({
 								</div>
 							</div>
 						)}
+						{trade.close_price != null && (
+							<div className="bg-zinc-900 rounded p-2">
+								<div className="text-zinc-500 mb-0.5">CLOSE PRICE</div>
+								<div className="text-white">${trade.close_price.toLocaleString()}</div>
+							</div>
+						)}
+						{trade.price_move_pct != null && (
+							<div className="bg-zinc-900 rounded p-2">
+								<div className="text-zinc-500 mb-0.5">PRICE MOVE</div>
+								<div className={cn(
+									"font-bold",
+									trade.price_move_pct >= 0 ? "text-accent-green" : "text-accent-red",
+								)}>
+									{trade.price_move_pct >= 0 ? "+" : ""}{trade.price_move_pct.toFixed(3)}%
+								</div>
+							</div>
+						)}
 						{holdSec != null && (
 							<div className="bg-zinc-900 rounded p-2">
 								<div className="text-zinc-500 mb-0.5">TIME INTO WINDOW</div>
 								<div className="text-white">
 									{holdSec >= 60 ? `${Math.floor(holdSec / 60)}m ` : ""}
 									{holdSec % 60}s into window
+								</div>
+							</div>
+						)}
+						{trade.resolution_method && (
+							<div className="bg-zinc-900 rounded p-2 col-span-2">
+								<div className="text-zinc-500 mb-0.5">RESOLVED VIA</div>
+								<div className={cn(
+									"text-xs font-bold",
+									trade.resolution_method === "oracle" ? "text-accent-green" :
+									trade.resolution_method === "clob" ? "text-indigo-400" :
+									trade.resolution_method === "paper" ? "text-zinc-400" :
+									"text-yellow-400",
+								)}>
+									{trade.resolution_method === "oracle" ? "Polymarket Oracle ✓" :
+									 trade.resolution_method === "clob" ? "CLOB Mid-Price" :
+									 trade.resolution_method === "binance" ? "Binance Fallback ⚠" :
+									 "Paper"}
 								</div>
 							</div>
 						)}

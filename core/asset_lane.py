@@ -11,6 +11,7 @@ live on PolyOracle and are passed in at creation time.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -61,6 +62,9 @@ class AssetLane:
     # Per-window mutable state
     last_trade_votes: list = field(default_factory=list)
     last_eval_tick: float = 0.0
+    # Prevents concurrent _maybe_trade_lane calls from both passing the
+    # "no existing order" check before either has finished placing an order.
+    trade_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @classmethod
     def create(
@@ -99,10 +103,11 @@ class AssetLane:
             poly_ws=poly_ws,
             oracle=oracle,
             consensus_engine=consensus,
+            min_delta_pct=config.min_delta_pct,
         )
 
         order_manager = OrderManager()
-        claimer = Claimer(order_manager)
+        claimer = Claimer(order_manager, lane_id=config.slug_prefix)
 
         executor = PolymarketExecutor(
             wallet=wallet,  # type: ignore[arg-type]
